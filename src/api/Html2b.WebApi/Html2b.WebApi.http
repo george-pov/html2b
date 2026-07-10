@@ -1,0 +1,6 @@
+@Html2b.WebApi_HostAddress = http://localhost:5293
+
+GET {{Html2b.WebApi_HostAddress}}/weatherforecast/
+Accept: application/json
+
+###
