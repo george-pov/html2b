@@ -90,17 +90,6 @@ The first useful version is expected to support:
 
 Possible later capabilities include template versioning, a browser-based template editor and preview, batch rendering, additional output formats, storage integrations, and event-driven generation.
 
-## Development
-
-The repository is currently a scaffold and does not yet contain a solution or runnable projects. Once the initial .NET solution is added, the expected commands are:
-
-```powershell
-dotnet restore
-dotnet build --configuration Release
-dotnet test --configuration Release
-dotnet run --project src/Html2B.WebApi
-```
-
 ## Security considerations
 
 Rendering user-authored HTML is a security-sensitive operation. The service will need strict isolation, resource and execution limits, controlled network access, input validation, and safe asset handling before it can accept untrusted templates.
