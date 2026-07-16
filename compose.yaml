@@ -1,0 +1,8 @@
+services:
+  html2b-api:
+    image: html2b-api:poc
+    build:
+      context: .
+      dockerfile: src/api/Html2b.WebApi/Dockerfile
+    ports:
+      - "8080:8080"

@@ -1,3 +1,5 @@
+using Html2b.WebApi.Rendering;
+
 namespace Html2b.WebApi
 {
     public class Program
@@ -6,18 +8,10 @@ namespace Html2b.WebApi
         {
             var builder = WebApplication.CreateBuilder(args);
 
-            // Add services to the container.
-
             builder.Services.AddControllers();
+            builder.Services.AddTransient<ChromiumRenderer>();
 
             var app = builder.Build();
-
-            // Configure the HTTP request pipeline.
-
-            app.UseHttpsRedirection();
-
-            app.UseAuthorization();
-
 
             app.MapControllers();
 

@@ -1,0 +1,6 @@
+.git
+.work
+build
+.vs
+**/bin
+**/obj
