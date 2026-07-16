@@ -3,3 +3,15 @@
 POST {{Html2b.WebApi_HostAddress}}/api/renders/png
 
 ###
+
+POST {{Html2b.WebApi_HostAddress}}/api/renders/jpeg
+
+###
+
+POST {{Html2b.WebApi_HostAddress}}/api/renders/pdf
+
+###
+
+POST {{Html2b.WebApi_HostAddress}}/api/renders/gif
+
+###

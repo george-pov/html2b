@@ -36,10 +36,64 @@ public sealed class RendersController(ChromiumRenderer renderer) : ControllerBas
         </html>
         """;
 
-    [HttpPost("png")]
-    public async Task<IActionResult> PostPngAsync(CancellationToken cancellationToken)
+    [HttpPost("{format}")]
+    public async Task<IActionResult> PostAsync(
+        string format,
+        CancellationToken cancellationToken)
     {
-        var bytes = await renderer.RenderPngAsync(PocHtml, cancellationToken);
-        return File(bytes, "image/png", "html2b-poc.png");
+        if (!TryParseFormat(format, out var renderFormat))
+        {
+            return Problem(
+                statusCode: StatusCodes.Status400BadRequest,
+                title: "Unsupported output format",
+                detail: "Supported formats: png, jpeg, pdf.");
+        }
+
+        var bytes = await renderer.RenderAsync(
+            PocHtml,
+            renderFormat,
+            cancellationToken);
+        var responseMetadata = GetResponseMetadata(renderFormat);
+
+        return File(
+            bytes,
+            responseMetadata.ContentType,
+            responseMetadata.FileName);
+    }
+
+    private static bool TryParseFormat(string value, out RenderFormat format)
+    {
+        if (string.Equals(value, "png", StringComparison.OrdinalIgnoreCase))
+        {
+            format = RenderFormat.Png;
+            return true;
+        }
+
+        if (string.Equals(value, "jpeg", StringComparison.OrdinalIgnoreCase))
+        {
+            format = RenderFormat.Jpeg;
+            return true;
+        }
+
+        if (string.Equals(value, "pdf", StringComparison.OrdinalIgnoreCase))
+        {
+            format = RenderFormat.Pdf;
+            return true;
+        }
+
+        format = default;
+        return false;
+    }
+
+    private static (string ContentType, string FileName) GetResponseMetadata(
+        RenderFormat format)
+    {
+        return format switch
+        {
+            RenderFormat.Png => ("image/png", "html2b-poc.png"),
+            RenderFormat.Jpeg => ("image/jpeg", "html2b-poc.jpg"),
+            RenderFormat.Pdf => ("application/pdf", "html2b-poc.pdf"),
+            _ => throw new ArgumentOutOfRangeException(nameof(format)),
+        };
     }
 }
