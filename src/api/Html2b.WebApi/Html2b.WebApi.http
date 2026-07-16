@@ -1,5 +1,13 @@
 @Html2b.WebApi_HostAddress = http://localhost:8080
 
+GET {{Html2b.WebApi_HostAddress}}/health/live
+
+###
+
+GET {{Html2b.WebApi_HostAddress}}/health/ready
+
+###
+
 POST {{Html2b.WebApi_HostAddress}}/api/renders/png
 
 ###
