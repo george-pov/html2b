@@ -1,10 +1,14 @@
 using System.Diagnostics;
 
+using Html2b.Application.Rendering;
+using Html2b.Domain.Rendering;
+
 using Microsoft.Playwright;
 
-namespace Html2b.WebApi.Rendering;
+namespace Html2b.Render.Rendering;
 
 public sealed class ChromiumRenderer(ILogger<ChromiumRenderer> logger) :
+    IRenderEngine,
     IHostedService,
     IAsyncDisposable
 {
@@ -120,7 +124,7 @@ public sealed class ChromiumRenderer(ILogger<ChromiumRenderer> logger) :
         }
     }
 
-    public async Task<byte[]> RenderAsync(
+    public async Task<RenderedFile> RenderAsync(
         string html,
         RenderFormat format,
         CancellationToken cancellationToken)
@@ -131,7 +135,7 @@ public sealed class ChromiumRenderer(ILogger<ChromiumRenderer> logger) :
 
         logger.LogInformation(
             "Waiting to start {Format} render {RenderId}",
-            format,
+            format.Value,
             renderId);
 
         try
@@ -144,7 +148,7 @@ public sealed class ChromiumRenderer(ILogger<ChromiumRenderer> logger) :
 
             logger.LogInformation(
                 "Starting {Format} render {RenderId}",
-                format,
+                format.Value,
                 renderId);
 
             await using var context = await CreateContextAsync(browser);
@@ -168,21 +172,20 @@ public sealed class ChromiumRenderer(ILogger<ChromiumRenderer> logger) :
                     });
 
                 cancellationToken.ThrowIfCancellationRequested();
-                var bytes = format switch
+                var renderedFile = format.Value switch
                 {
-                    RenderFormat.Png => await CaptureScreenshotAsync(page, format),
-                    RenderFormat.Jpeg => await CaptureScreenshotAsync(page, format),
-                    RenderFormat.Pdf => await CreatePdfAsync(page),
+                    "png" or "jpeg" => await CaptureScreenshotAsync(page, format),
+                    "pdf" => await CreatePdfAsync(page),
                     _ => throw new ArgumentOutOfRangeException(nameof(format)),
                 };
 
                 logger.LogInformation(
                     "Completed {Format} render {RenderId} in {ElapsedMilliseconds} ms",
-                    format,
+                    format.Value,
                     renderId,
                     stopwatch.ElapsedMilliseconds);
 
-                return bytes;
+                return renderedFile;
             }
             finally
             {
@@ -197,7 +200,7 @@ public sealed class ChromiumRenderer(ILogger<ChromiumRenderer> logger) :
             logger.LogError(
                 exception,
                 "{Format} render {RenderId} failed after {ElapsedMilliseconds} ms",
-                format,
+                format.Value,
                 renderId,
                 stopwatch.ElapsedMilliseconds);
             throw;
@@ -239,18 +242,20 @@ public sealed class ChromiumRenderer(ILogger<ChromiumRenderer> logger) :
         }
     }
 
-    private static Task<byte[]> CaptureScreenshotAsync(
+    private static async Task<RenderedFile> CaptureScreenshotAsync(
         IPage page,
         RenderFormat format)
     {
+        var type = format.Value switch
+        {
+            "png" => ScreenshotType.Png,
+            "jpeg" => ScreenshotType.Jpeg,
+            _ => throw new ArgumentOutOfRangeException(nameof(format)),
+        };
+
         var options = new PageScreenshotOptions
         {
-            Type = format switch
-            {
-                RenderFormat.Png => ScreenshotType.Png,
-                RenderFormat.Jpeg => ScreenshotType.Jpeg,
-                _ => throw new ArgumentOutOfRangeException(nameof(format)),
-            },
+            Type = type,
             Animations = ScreenshotAnimations.Disabled,
             Scale = ScreenshotScale.Css,
             Timeout = OperationTimeoutMilliseconds,
@@ -261,10 +266,17 @@ public sealed class ChromiumRenderer(ILogger<ChromiumRenderer> logger) :
             options.Quality = 90;
         }
 
-        return page.ScreenshotAsync(options);
+        var content = await page.ScreenshotAsync(options);
+
+        return new RenderedFile(
+            content,
+            format == RenderFormat.Png ? "image/png" : "image/jpeg",
+            format == RenderFormat.Png
+                ? "html2b-poc.png"
+                : "html2b-poc.jpg");
     }
 
-    private static async Task<byte[]> CreatePdfAsync(IPage page)
+    private static async Task<RenderedFile> CreatePdfAsync(IPage page)
     {
         await page.EmulateMediaAsync(
             new PageEmulateMediaOptions
@@ -287,8 +299,13 @@ public sealed class ChromiumRenderer(ILogger<ChromiumRenderer> logger) :
                 PrintBackground = true,
             });
 
-        return await pdfTask.WaitAsync(
+        var content = await pdfTask.WaitAsync(
             TimeSpan.FromMilliseconds(OperationTimeoutMilliseconds));
+
+        return new RenderedFile(
+            content,
+            "application/pdf",
+            "html2b-poc.pdf");
     }
 
     private static Task<IBrowserContext> CreateContextAsync(IBrowser browser)

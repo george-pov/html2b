@@ -1,3 +1,8 @@
 <Solution>
-  <Project Path="Html2b.WebApi/Html2b.WebApi.csproj" />
+  <Project Path="Html2b.ApiFunctions/Html2b.ApiFunctions.csproj" />
+  <Project Path="Html2b.Application/Html2b.Application.csproj" />
+  <Project Path="Html2b.Contracts/Html2b.Contracts.csproj" />
+  <Project Path="Html2b.Domain/Html2b.Domain.csproj" />
+  <Project Path="Html2b.Infrastructure/Html2b.Infrastructure.csproj" />
+  <Project Path="Html2b.Render/Html2b.Render.csproj" />
 </Solution>

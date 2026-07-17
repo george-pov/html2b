@@ -1,0 +1,10 @@
+{
+  "$schema": "https://json.schemastore.org/launchsettings.json",
+  "profiles": {
+    "Html2b.ApiFunctions": {
+      "commandName": "Project",
+      "commandLineArgs": "--port 8080 --cors http://localhost:4200,http://127.0.0.1:4200",
+      "launchBrowser": false
+    }
+  }
+}

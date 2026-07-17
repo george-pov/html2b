@@ -1,0 +1,17 @@
+[
+  {
+    "Name": "Html2b local",
+    "Projects": [
+      {
+        "Path": "Html2b.Render\\Html2b.Render.csproj",
+        "Action": "Start",
+        "DebugTarget": "Container (Dockerfile)"
+      },
+      {
+        "Path": "Html2b.ApiFunctions\\Html2b.ApiFunctions.csproj",
+        "Action": "Start",
+        "DebugTarget": "Html2b.ApiFunctions"
+      }
+    ]
+  }
+]

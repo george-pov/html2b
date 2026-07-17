@@ -12,9 +12,11 @@ The primary use case is generating thumbnail images for YouTube streams, but the
 ## Containerized rendering POC
 
 The repository includes a local proof of concept under `src/api` that runs one
-ASP.NET Core API and one Playwright-managed Chromium browser in the same Linux
-container. The POC renders one trusted, server-owned HTML document at 1280 by
-720 and returns PNG, JPEG, or PDF bytes without persisting output.
+public .NET isolated Functions host and one private ASP.NET Core Render host.
+The Functions host runs through Azure Functions Core Tools on Windows. Docker
+Compose runs Render and its Playwright-managed Chromium browser with a
+loopback-only binding. The POC renders one trusted, server-owned HTML document
+at 1280 by 720 and returns PNG, JPEG, or PDF bytes without persisting output.
 
 ### Windows prerequisites
 
@@ -24,6 +26,7 @@ The verified Windows setup uses:
 - Docker Desktop with the WSL 2 backend and Linux container mode.
 - Docker Compose v2.
 - The .NET 10 SDK.
+- Azure Functions Core Tools 4.
 
 Verify an existing workstation from PowerShell:
 
@@ -31,6 +34,7 @@ Verify an existing workstation from PowerShell:
 wsl --version
 wsl --list --verbose
 dotnet --list-sdks
+func --version
 docker version
 docker compose version
 docker info --format '{{.OSType}}'
@@ -44,29 +48,71 @@ host. Azure CLI is not required for this POC.
 
 ### Run locally
 
-From the repository root, build and start the service:
+From the repository root, build and start the private Render service:
 
 ```powershell
-docker compose up --build
+docker compose up --build html2b-render
 ```
 
-The API listens over HTTP at `http://localhost:8080`. In another terminal,
-check process liveness and browser readiness:
+Compose publishes Render only at `127.0.0.1:8081`; it is not bound to the LAN.
+For Visual Studio debugging, create the ignored local Functions settings file
+once:
+
+```powershell
+Copy-Item `
+    src/api/Html2b.ApiFunctions/local.settings.sample.json `
+    src/api/Html2b.ApiFunctions/local.settings.json
+```
+
+In the copied `local.settings.json`, set
+`RenderService__BaseUrl` to `http://localhost:8081`; the tracked sample keeps a
+placeholder value.
+
+Visual Studio 2026 can start both processes with one F5:
+
+1. Open `src/api/Html2b.slnx`.
+2. Select the shared `Html2b local` launch profile.
+3. Press F5. Visual Studio starts `Html2b.Render` in its Linux Docker container
+   on `127.0.0.1:8081` and starts `Html2b.ApiFunctions` on the Windows host at
+   `http://localhost:8080`.
+
+Run `docker compose down` first if a manually started Compose container already
+owns port 8081.
+
+If the container runtime is stopped, configure **Tools > Options > Container
+Tools > General > Start the container runtime if needed** to start it
+automatically.
+
+To run without Visual Studio, start the public Functions host in a second
+terminal:
+
+```powershell
+$env:FUNCTIONS_WORKER_RUNTIME = 'dotnet-isolated'
+$env:RenderService__BaseUrl = 'http://localhost:8081'
+Push-Location src/api/Html2b.ApiFunctions
+func start --port 8080
+Pop-Location
+```
+
+The public API listens over HTTP at `http://localhost:8080`. In a third
+terminal, check process liveness and end-to-end browser readiness:
 
 ```powershell
 Invoke-WebRequest http://localhost:8080/health/live
 Invoke-WebRequest http://localhost:8080/health/ready
 ```
 
-Stop the service and its local Compose network with:
+Stop Core Tools with Ctrl+C. Then stop the private Render service and its local
+Compose network:
 
 ```powershell
 docker compose down
 ```
 
-The image runs the API as the non-root `pwuser` under `tini`, includes a Docker
+The image runs Render as the non-root `pwuser` under `tini`, includes a Docker
 liveness health check, and gives the hosted browser up to 30 seconds to shut
-down cleanly.
+down cleanly. The API-to-Render call is a temporary bounded private HTTP bridge:
+each render has a 75-second budget and a 16 MiB response cap.
 
 ### POC endpoints
 
@@ -90,8 +136,8 @@ Invoke-WebRequest -Method Post -Uri http://localhost:8080/api/renders/pdf -OutFi
 ```
 
 Other format values return HTTP 400 problem details listing `png`, `jpeg`, and
-`pdf` as the supported values. The process reuses one hosted browser, permits
-one active render at a time, and creates a fresh restricted browser context and
+`pdf` as the supported values. Render reuses one hosted browser, permits one
+active render at a time, and creates a fresh restricted browser context and
 page for every request.
 
 ### POC limitations
@@ -100,15 +146,138 @@ page for every request.
   does not accept templates, tokens, caller HTML, uploads, URLs, or assets.
 - JavaScript, service workers, downloads, and HTTP or HTTPS page requests are
   blocked. Output remains in memory and is not persisted.
+- The synchronous private HTTP request and in-memory relay are transitional.
+  No queue, job store, Blob output, or durable retry exists yet.
 - The approved POC has no automated test project; its API, output, browser, and
   container lifecycle were validated manually.
 - The Playwright container launches Chromium with `--no-sandbox`. Combined
   with the lack of authentication, resource limits, and production isolation,
   this makes the image unsuitable as a sandbox for untrusted HTML.
-- Azure deployment is not implemented. This repository does not install or use
-  Azure CLI, publish an image to a registry, create Container Apps resources,
-  configure ingress, probes, identity, secrets, or scaling, or validate a live
-  Azure endpoint. Those are future deployment and production-hardening tasks.
+- The Azure deployment described below is manual, development-only, public,
+  and unauthenticated. It does not make the renderer safe for untrusted HTML or
+  provide production availability.
+
+## Azure dev deployment
+
+> [!WARNING]
+> The immutable Feature 002 image shown below remains live and can be retained
+> as a rollback target, but its single-container publication workflow does not
+> support the split Feature 003 source. Do not run
+> `scripts/azure/Publish-Html2bImage.ps1` from current `HEAD`, do not repoint it
+> to only one of the new hosts, and do not deploy a new Feature 003 image to
+> the existing single-container app. Feature 007 owns the replacement
+> deployment topology and publication workflow.
+
+The repository includes Bicep and local PowerShell helpers for the manually
+operated development environment in `rg-html2b-dev` (`westus2`). The verified
+environment contains exactly:
+
+| Resource | Name |
+| --- | --- |
+| Azure Container Registry | `crhtml2bdev` |
+| Log Analytics workspace | `log-html2b-dev` |
+| Container Apps environment | `cae-html2b-dev` |
+| User-assigned runtime identity | `id-html2b-api-dev` |
+| Container App | `ca-html2b-dev` |
+
+The generated endpoint is
+[`https://ca-html2b-dev.ashyisland-b79aded0.westus2.azurecontainerapps.io`](https://ca-html2b-dev.ashyisland-b79aded0.westus2.azurecontainerapps.io).
+It has external HTTPS ingress, no application authentication, one active
+revision, 1 vCPU, 2 GiB of memory, and scales from zero to at most one replica.
+The runtime identity can pull only from the `html2b-api` ACR repository. The
+local deployment operator can write only to that repository; ACR admin and
+anonymous access are disabled.
+
+### Prerequisites
+
+The verified manual workflow uses PowerShell 7, Azure CLI with Bicep, Docker
+Desktop in Linux container mode, and the .NET 10 SDK. Sign in to Azure and
+select the intended subscription before running a deployment command:
+
+```powershell
+az account show --query '{name:name,id:id,tenantId:tenantId,state:state}'
+```
+
+The operator needs permission to create the planned resources and role
+assignments. The scripts are deliberately limited to the exact dev resource
+names above. They do not create GitHub/OIDC deployment identities, registry
+passwords, or remote automation.
+
+### Deploy manually
+
+For a first deployment, validate and preview the image-ready foundation:
+
+```powershell
+./scripts/azure/Deploy-AzureDev.ps1 -Operation Validate
+./scripts/azure/Deploy-AzureDev.ps1 -Operation WhatIf
+```
+
+Inspect the exact subscription, resource group, names, tags, and repository
+role conditions. After separate approval for the live foundation mutation, run:
+
+```powershell
+./scripts/azure/Deploy-AzureDev.ps1 -Operation ApplyFoundation -Confirm
+```
+
+Application mode references the existing foundation and cannot silently
+converge ACR, logging, identity, or the Container Apps environment. A later
+foundation change must use its own preview, explicit approval, and
+`ApplyFoundation` operation. Current `HEAD` has no approved image publication
+or application-apply path for this Feature 002 topology.
+
+### Validate the live service
+
+Run the live validator with the deployed immutable digest:
+
+```powershell
+$containerImage = 'crhtml2bdev.azurecr.io/html2b-api@sha256:c12f592d54c04011c7c83db9a22d811107877fbac69777cd3cb881dff505eeb9'
+./scripts/azure/Test-AzureDev.ps1 -ExpectedContainerImage $containerImage
+```
+
+The validator checks the exact resource inventory, repository roles, runtime
+pull identity, revision health, HTTPS redirect, probes, CPU/memory, replica cap,
+PNG/JPEG/PDF headers and bytes, raster dimensions, PDF page size, and sanitized
+logs. It then waits for zero replicas, wakes the service through readiness, and
+repeats the render checks. The first verified run scaled to zero in 466.7
+seconds and became Chromium-ready 26 seconds after the cold request. Evidence
+is written beneath `build/validation/002/p01/live/` and is not committed.
+
+The current verified image is:
+
+```text
+crhtml2bdev.azurecr.io/html2b-api@sha256:c12f592d54c04011c7c83db9a22d811107877fbac69777cd3cb881dff505eeb9
+```
+
+### Deploy a new image
+
+Do not deploy a new image from current `HEAD` to the Feature 002 Container App.
+Wait for Feature 007 to define and validate both deployable hosts, their
+network boundary, and the replacement publication workflow. Existing ACR
+artifacts remain retained and may incur charges; do not retag a digest or use
+`latest` as an update or rollback mechanism.
+
+### Roll back an image
+
+Rollback is another reviewed immutable deployment, not a traffic edit or tag
+mutation. Preview the previously recorded digest, obtain live-apply approval,
+apply it as a new revision, and rerun full validation:
+
+```powershell
+$previousImage = 'crhtml2bdev.azurecr.io/html2b-api@sha256:c12f592d54c04011c7c83db9a22d811107877fbac69777cd3cb881dff505eeb9'
+./scripts/azure/Deploy-AzureDev.ps1 -Operation WhatIf -ContainerImage $previousImage
+./scripts/azure/Deploy-AzureDev.ps1 -Operation Apply -ContainerImage $previousImage -Confirm
+./scripts/azure/Test-AzureDev.ps1 -ExpectedContainerImage $previousImage
+```
+
+The first deployment has no earlier live digest to restore. A usable rollback
+point exists only after a later image update has recorded the current digest.
+Do not delete failed revisions or images as part of rollback.
+
+This environment remains manual and development-only. It has no custom domain,
+authentication, persistence, backup, production SLA, multi-replica
+availability, or untrusted-content sandbox. Fixed trusted HTML is the only
+supported render input. The public endpoint, retained ACR artifacts, and Log
+Analytics ingestion can incur Azure charges even though the app scales to zero.
 
 ## How it works
 

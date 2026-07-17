@@ -29,6 +29,7 @@ _ReSharper*/
 [Tt]est[Rr]esult*
 .vs/
 .idea/
+local.settings.json
 #Nuget packages folder
 packages/
 /build

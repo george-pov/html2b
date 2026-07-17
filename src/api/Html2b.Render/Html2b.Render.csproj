@@ -4,11 +4,16 @@
     <TargetFramework>net10.0</TargetFramework>
     <Nullable>enable</Nullable>
     <ImplicitUsings>enable</ImplicitUsings>
-    <UserSecretsId>1ca0543e-86d0-40e3-8fcb-3e233dd0779e</UserSecretsId>
     <DockerDefaultTargetOS>Linux</DockerDefaultTargetOS>
-    <DockerfileContext>..\..\..</DockerfileContext>
+    <ContainerBuildContext>..\..\..</ContainerBuildContext>
     <ContainerDevelopmentMode>Regular</ContainerDevelopmentMode>
   </PropertyGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\Html2b.Application\Html2b.Application.csproj" />
+    <ProjectReference Include="..\Html2b.Contracts\Html2b.Contracts.csproj" />
+    <ProjectReference Include="..\Html2b.Domain\Html2b.Domain.csproj" />
+  </ItemGroup>
 
   <ItemGroup>
     <PackageReference Include="Microsoft.Playwright" Version="1.61.0" />

@@ -1,0 +1,9 @@
+{
+  "_comment": "Tracked sample for html2b.",
+  "IsEncrypted": false,
+  "Values": {
+    "AzureWebJobsStorage": "UseDevelopmentStorage=true",
+    "FUNCTIONS_WORKER_RUNTIME": "dotnet-isolated",
+    "RenderService__BaseUrl": "http://some-url:someport"
+  }
+}

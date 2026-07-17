@@ -1,9 +1,9 @@
 services:
-  html2b-api:
-    image: html2b-api:poc
+  html2b-render:
+    image: html2b-render:poc
     build:
       context: .
-      dockerfile: src/api/Html2b.WebApi/Dockerfile
+      dockerfile: src/api/Html2b.Render/Dockerfile
     ports:
-      - "8080:8080"
+      - "127.0.0.1:8081:8080"
     stop_grace_period: 30s
