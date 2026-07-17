@@ -1,0 +1,25 @@
+@Html2b.AzureFunctions_HostAddress = http://localhost:8080
+
+GET {{Html2b.AzureFunctions_HostAddress}}/health/live
+
+###
+
+GET {{Html2b.AzureFunctions_HostAddress}}/health/ready
+
+###
+
+POST {{Html2b.AzureFunctions_HostAddress}}/api/renders/png
+
+###
+
+POST {{Html2b.AzureFunctions_HostAddress}}/api/renders/jpeg
+
+###
+
+POST {{Html2b.AzureFunctions_HostAddress}}/api/renders/pdf
+
+###
+
+POST {{Html2b.AzureFunctions_HostAddress}}/api/renders/gif
+
+###

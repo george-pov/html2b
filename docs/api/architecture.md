@@ -7,7 +7,7 @@ Html2B API, template-management capabilities, and asynchronous rendering
 pipeline. The six production project boundaries now exist, but the durable
 queue, persistence, and target Azure topology remain future work.
 
-The current Feature 003 proof of concept runs `Html2b.ApiFunctions` as the
+The current Feature 003 proof of concept runs `Html2b.AzureFunctions` as the
 public .NET isolated Functions host and `Html2b.Render` as a loopback-only
 ASP.NET Core Minimal API container. `Html2b.Infrastructure` calls Render through
 an explicitly transitional private HTTP bridge that carries only a versioned
@@ -25,7 +25,7 @@ docs/
 src/
   api/
     Html2b.slnx
-    Html2b.ApiFunctions/
+    Html2b.AzureFunctions/
     Html2b.Render/
     Html2b.Domain/
     Html2b.Application/
@@ -33,7 +33,7 @@ src/
     Html2b.Contracts/
 
     Test/
-      Html2b.ApiFunctions.Tests/
+      Html2b.AzureFunctions.Tests/
       Html2b.Render.Tests/
       Html2b.Domain.Tests/
       Html2b.Application.Tests/
@@ -51,7 +51,7 @@ above remains the target; Feature 003 intentionally added no test projects.
 
 The production projects form one modular backend with two deployable hosts:
 
-- `Html2b.ApiFunctions` is the public control-plane host.
+- `Html2b.AzureFunctions` is the public control-plane host.
 - `Html2b.Render` is the private render host. Its Feature 003 Minimal API is
   temporary; the target host is queue-driven.
 - `Html2b.Domain`, `Html2b.Application`, `Html2b.Infrastructure`, and
@@ -73,7 +73,7 @@ Chromium, stores the result, and updates the job status.
 
 ```mermaid
 flowchart LR
-    Caller["Browser or API client"] --> Api["Html2b.ApiFunctions"]
+    Caller["Browser or API client"] --> Api["Html2b.AzureFunctions"]
     Api --> App["Html2b.Application"]
     Api --> Infra["Html2b.Infrastructure"]
     App --> Domain["Html2b.Domain"]
@@ -95,7 +95,7 @@ queue contract. They do not call each other directly.
 
 The current Feature 003 graph is narrower than the target diagram below:
 
-- ApiFunctions references Application and Infrastructure.
+- `Html2b.AzureFunctions` references Application and Infrastructure.
 - Render references Application, Domain, and Contracts.
 - Infrastructure references Application, Domain, and Contracts.
 - Application references Domain.
@@ -106,7 +106,7 @@ An arrow in this diagram means "has a project reference to."
 
 ```mermaid
 flowchart TD
-    Api["Html2b.ApiFunctions"] --> Application["Html2b.Application"]
+    Api["Html2b.AzureFunctions"] --> Application["Html2b.Application"]
     Api --> Infrastructure["Html2b.Infrastructure"]
     Api --> Contracts["Html2b.Contracts"]
 
@@ -129,7 +129,7 @@ The dependency rules are:
    Application, Domain, and Contracts.
 4. The two hosts compose the application and may depend on Application,
    Infrastructure, and Contracts.
-5. `Html2b.ApiFunctions` and `Html2b.Render` never reference each other.
+5. `Html2b.AzureFunctions` and `Html2b.Render` never reference each other.
 6. No production project references a test project.
 7. Circular project references are not allowed.
 
@@ -276,9 +276,9 @@ It does not own:
 Infrastructure repositories return Domain objects. Application decides when a
 workflow is complete; Infrastructure performs the requested durable writes.
 
-### Html2b.ApiFunctions
+### Html2b.AzureFunctions
 
-`Html2b.ApiFunctions` is the public Azure Functions host and the composition
+`Html2b.AzureFunctions` is the public Azure Functions host and the composition
 root for the control plane.
 
 Responsibilities:
@@ -349,7 +349,8 @@ It does not own:
 
 The proven `ChromiumRenderer` behavior is implemented in this project. During
 Feature 003, a private Minimal API endpoint invokes it with Render-owned
-hardcoded HTML and returns a bounded file response to ApiFunctions. That
+hardcoded HTML and returns a bounded file response to `Html2b.AzureFunctions`.
+That
 endpoint and its synchronous HTTP client are removed when the durable
 queue-backed path has equivalent format coverage. Browser reuse is an
 optimization inside one replica; every future queued job must still reference
@@ -365,7 +366,7 @@ boundaries.
 | `Html2b.Domain.Tests` | Domain invariants, state transitions, value objects, and template rules | Domain |
 | `Html2b.Application.Tests` | Use-case orchestration, authorization, idempotency, and failure behavior through fakes | Application, Domain |
 | `Html2b.Infrastructure.Tests` | Persistence mapping, Azure adapter behavior, contract serialization, and emulator/integration tests | Infrastructure, Application, Domain, Contracts |
-| `Html2b.ApiFunctions.Tests` | HTTP contract, authentication/authorization boundary, request mapping, and response status/headers | ApiFunctions, Application, Contracts |
+| `Html2b.AzureFunctions.Tests` | HTTP contract, authentication/authorization boundary, request mapping, and response status/headers | `Html2b.AzureFunctions`, Application, Contracts |
 | `Html2b.Render.Tests` | Queue processing, retry/settlement, browser lifecycle, isolation, output formats, and graceful shutdown | Render, Application, Contracts |
 
 Create a shared test-support project only after real duplication appears. Test
@@ -421,7 +422,7 @@ The intended deployment mapping is:
 
 | Source project | Azure runtime |
 | --- | --- |
-| `Html2b.ApiFunctions` | Azure Functions |
+| `Html2b.AzureFunctions` | Azure Functions |
 | `Html2b.Render` | Azure Container App without public ingress |
 | `Html2b.Domain` | Library included in both application builds as needed |
 | `Html2b.Application` | Library included in both application builds |

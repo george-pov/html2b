@@ -60,8 +60,8 @@ once:
 
 ```powershell
 Copy-Item `
-    src/api/Html2b.ApiFunctions/local.settings.sample.json `
-    src/api/Html2b.ApiFunctions/local.settings.json
+    src/api/Html2b.AzureFunctions/local.settings.sample.json `
+    src/api/Html2b.AzureFunctions/local.settings.json
 ```
 
 In the copied `local.settings.json`, set
@@ -73,7 +73,7 @@ Visual Studio 2026 can start both processes with one F5:
 1. Open `src/api/Html2b.slnx`.
 2. Select the shared `Html2b local` launch profile.
 3. Press F5. Visual Studio starts `Html2b.Render` in its Linux Docker container
-   on `127.0.0.1:8081` and starts `Html2b.ApiFunctions` on the Windows host at
+   on `127.0.0.1:8081` and starts `Html2b.AzureFunctions` on the Windows host at
    `http://localhost:8080`.
 
 Run `docker compose down` first if a manually started Compose container already
@@ -89,7 +89,7 @@ terminal:
 ```powershell
 $env:FUNCTIONS_WORKER_RUNTIME = 'dotnet-isolated'
 $env:RenderService__BaseUrl = 'http://localhost:8081'
-Push-Location src/api/Html2b.ApiFunctions
+Push-Location src/api/Html2b.AzureFunctions
 func start --port 8080
 Pop-Location
 ```

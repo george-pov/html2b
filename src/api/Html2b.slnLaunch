@@ -8,9 +8,9 @@
         "DebugTarget": "Container (Dockerfile)"
       },
       {
-        "Path": "Html2b.ApiFunctions\\Html2b.ApiFunctions.csproj",
+        "Path": "Html2b.AzureFunctions\\Html2b.AzureFunctions.csproj",
         "Action": "Start",
-        "DebugTarget": "Html2b.ApiFunctions"
+        "DebugTarget": "Html2b.AzureFunctions"
       }
     ]
   }

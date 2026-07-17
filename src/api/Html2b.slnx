@@ -1,5 +1,5 @@
 <Solution>
-  <Project Path="Html2b.ApiFunctions/Html2b.ApiFunctions.csproj" />
+  <Project Path="Html2b.AzureFunctions/Html2b.AzureFunctions.csproj" />
   <Project Path="Html2b.Application/Html2b.Application.csproj" />
   <Project Path="Html2b.Contracts/Html2b.Contracts.csproj" />
   <Project Path="Html2b.Domain/Html2b.Domain.csproj" />

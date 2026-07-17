@@ -5,7 +5,7 @@ using Microsoft.AspNetCore.Http;
 using Microsoft.AspNetCore.Mvc;
 using Microsoft.Azure.Functions.Worker;
 
-namespace Html2b.ApiFunctions.Functions;
+namespace Html2b.AzureFunctions.Functions;
 
 public sealed class RendersFunction(IPocRenderGateway renderGateway)
 {
