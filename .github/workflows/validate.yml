@@ -140,7 +140,14 @@ jobs:
       - name: Scan tracked and generated text for secrets
         shell: pwsh
         run: |
-          $trackedPattern = '(DefaultEndpointsProtocol=|AccountKey=[A-Za-z0-9+/=]{16,}|SharedAccessSignature=[A-Za-z0-9%&=]{16,}|ghp_[A-Za-z0-9]{20,}|-----BEGIN [A-Z ]+PRIVATE KEY-----)'
+          $trackedPatternParts = @(
+            ('DefaultEndpointsProtocol' + '='),
+            ('AccountKey' + '=[A-Za-z0-9+/=]{16,}'),
+            ('SharedAccessSignature' + '=[A-Za-z0-9%&=]{16,}'),
+            ('ghp_' + '[A-Za-z0-9]{20,}'),
+            ('-----BEGIN ' + '[A-Z ]+PRIVATE KEY-----')
+          )
+          $trackedPattern = '(' + ($trackedPatternParts -join '|') + ')'
           $matches = @(git grep -n -I -E $trackedPattern -- ':!scripts/azure/Test-AzureDevManifest.ps1')
           if ($LASTEXITCODE -notin @(0, 1)) {
             throw 'Tracked-source secret scan failed to run.'
@@ -148,7 +155,15 @@ jobs:
           if ($matches.Count -gt 0) {
             throw 'Tracked-source secret scan found a forbidden value.'
           }
-          $generatedPattern = '(AccountKey=|SharedAccessSignature=|InstrumentationKey=|Authorization:\s*Bearer|ghp_[A-Za-z0-9]{20,}|-----BEGIN [A-Z ]+PRIVATE KEY-----)'
+          $generatedPatternParts = @(
+            ('AccountKey' + '='),
+            ('SharedAccessSignature' + '='),
+            ('InstrumentationKey' + '='),
+            ('Authorization:' + '\s*Bearer'),
+            ('ghp_' + '[A-Za-z0-9]{20,}'),
+            ('-----BEGIN ' + '[A-Z ]+PRIVATE KEY-----')
+          )
+          $generatedPattern = '(' + ($generatedPatternParts -join '|') + ')'
           $generatedFiles = Get-ChildItem build/deployment/004 -Recurse -File |
             Where-Object Extension -in @('.json', '.txt', '.md')
           if ($null -ne ($generatedFiles | Select-String -Pattern $generatedPattern | Select-Object -First 1)) {
