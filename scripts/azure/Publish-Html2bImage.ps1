@@ -1,10 +1,16 @@
-[CmdletBinding(SupportsShouldProcess, ConfirmImpact = 'High')]
+[CmdletBinding()]
 param(
-    [switch] $Push,
-
+    [ValidatePattern('^[a-z0-9]{5,50}$')]
     [string] $RegistryName = 'crhtml2bdev',
 
-    [string] $RepositoryName = 'html2b-api'
+    [ValidatePattern('^[a-z0-9]+(?:[._/-][a-z0-9]+)*$')]
+    [string] $RepositoryName = 'html2b-render',
+
+    [Parameter(Mandatory)]
+    [ValidatePattern('^[0-9a-f]{40}$')]
+    [string] $SourceCommit,
+
+    [string] $OutputDirectory = 'build/deployment/004'
 )
 
 Set-StrictMode -Version Latest
@@ -12,29 +18,6 @@ $ErrorActionPreference = 'Stop'
 
 function Resolve-RepositoryRoot {
     return (Resolve-Path (Join-Path $PSScriptRoot '..\..')).Path
-}
-
-function Invoke-AzureCli {
-    param(
-        [Parameter(Mandatory)]
-        [string[]] $Arguments,
-
-        [switch] $AllowFailure
-    )
-
-    $output = & az @Arguments 2>&1
-    $exitCode = $LASTEXITCODE
-    $text = ($output | Out-String).Trim()
-
-    if ($exitCode -ne 0) {
-        if ($AllowFailure) {
-            return $null
-        }
-
-        throw "Azure CLI failed with exit code $exitCode.`n$text"
-    }
-
-    return $text
 }
 
 function Invoke-Docker {
@@ -60,13 +43,22 @@ function Invoke-Docker {
     return $text
 }
 
+function Invoke-DockerBuildx {
+    param(
+        [Parameter(Mandatory)]
+        [string[]] $Arguments
+    )
+
+    return Invoke-Docker -Arguments (@('buildx') + $Arguments)
+}
+
 function Get-SourceCommit {
     param(
         [Parameter(Mandatory)]
         [string] $RepositoryRoot
     )
 
-    $commit = (& git -C $RepositoryRoot rev-parse HEAD 2>&1 | Out-String).Trim()
+    $commit = (& git -C $RepositoryRoot rev-parse HEAD 2>$null | Out-String).Trim()
     if ($LASTEXITCODE -ne 0 -or $commit -cnotmatch '^[0-9a-f]{40}$') {
         throw 'Could not resolve a full lowercase Git commit SHA.'
     }
@@ -74,20 +66,63 @@ function Get-SourceCommit {
     return $commit
 }
 
-function Assert-CleanImageSource {
+function Assert-CleanRenderSource {
     param(
         [Parameter(Mandatory)]
-        [string] $RepositoryRoot
+        [string] $RepositoryRoot,
+
+        [Parameter(Mandatory)]
+        [string] $ExpectedCommit
     )
 
-    $changedInputs = (& git -C $RepositoryRoot diff --name-only HEAD -- src/api 2>&1 | Out-String).Trim()
-    if ($LASTEXITCODE -ne 0) {
-        throw 'Could not compare image inputs with HEAD.'
+    if ((Get-SourceCommit -RepositoryRoot $RepositoryRoot) -cne $ExpectedCommit) {
+        throw 'SourceCommit must equal the checked-out full HEAD commit.'
     }
 
-    if (-not [string]::IsNullOrWhiteSpace($changedInputs)) {
-        throw "Image publication requires tracked src/api inputs to match HEAD. Changed inputs:`n$changedInputs"
+    $renderInputs = @(
+        '.dockerignore',
+        'src/api/Html2b.Domain',
+        'src/api/Html2b.Application',
+        'src/api/Html2b.Contracts',
+        'src/api/Html2b.Render'
+    )
+    $status = (& git -C $RepositoryRoot status --porcelain --untracked-files=all -- @renderInputs 2>$null | Out-String).Trim()
+    if ($LASTEXITCODE -ne 0) {
+        throw 'Could not compare Render inputs with SourceCommit.'
     }
+
+    if (-not [string]::IsNullOrWhiteSpace($status)) {
+        throw 'Render build inputs must be committed in SourceCommit.'
+    }
+}
+
+function Resolve-RenderOutputDirectory {
+    param(
+        [Parameter(Mandatory)]
+        [string] $RepositoryRoot,
+
+        [Parameter(Mandatory)]
+        [string] $RequestedPath,
+
+        [Parameter(Mandatory)]
+        [string] $SourceCommit
+    )
+
+    $basePath = if ([System.IO.Path]::IsPathRooted($RequestedPath)) {
+        [System.IO.Path]::GetFullPath($RequestedPath)
+    }
+    else {
+        [System.IO.Path]::GetFullPath((Join-Path $RepositoryRoot $RequestedPath))
+    }
+
+    $buildRoot = [System.IO.Path]::GetFullPath((Join-Path $RepositoryRoot 'build'))
+    if (-not $basePath.StartsWith("$buildRoot$([System.IO.Path]::DirectorySeparatorChar)", [System.StringComparison]::OrdinalIgnoreCase)) {
+        throw 'OutputDirectory must remain beneath the repository build directory.'
+    }
+
+    $renderPath = Join-Path (Join-Path $basePath $SourceCommit) 'render'
+    $null = New-Item -ItemType Directory -Force -Path $renderPath
+    return $renderPath
 }
 
 function Get-AvailableTcpPort {
@@ -112,7 +147,7 @@ function Wait-HttpReady {
     )
 
     $client = [System.Net.Http.HttpClient]::new()
-    $client.Timeout = [TimeSpan]::FromSeconds(10)
+    $client.Timeout = [TimeSpan]::FromSeconds(5)
     $stopwatch = [System.Diagnostics.Stopwatch]::StartNew()
 
     try {
@@ -129,10 +164,10 @@ function Wait-HttpReady {
                 }
             }
             catch [System.Net.Http.HttpRequestException] {
-                # The container may not be listening yet.
+                # The bounded readiness loop handles startup races.
             }
             catch [System.Threading.Tasks.TaskCanceledException] {
-                # Keep polling within the bounded outer timeout.
+                # The bounded readiness loop handles individual request timeouts.
             }
 
             Start-Sleep -Seconds 2
@@ -146,27 +181,19 @@ function Wait-HttpReady {
 }
 
 function Get-BigEndianUInt16 {
-    param(
-        [byte[]] $Bytes,
-        [int] $Offset
-    )
-
+    param([byte[]] $Bytes, [int] $Offset)
     return ([int] $Bytes[$Offset] -shl 8) -bor [int] $Bytes[$Offset + 1]
 }
 
 function Get-BigEndianUInt32 {
-    param(
-        [byte[]] $Bytes,
-        [int] $Offset
-    )
-
+    param([byte[]] $Bytes, [int] $Offset)
     return ([int64] $Bytes[$Offset] -shl 24) -bor
         ([int64] $Bytes[$Offset + 1] -shl 16) -bor
         ([int64] $Bytes[$Offset + 2] -shl 8) -bor
         [int64] $Bytes[$Offset + 3]
 }
 
-function Assert-LocalOutputContract {
+function Assert-RenderOutputContract {
     param(
         [Parameter(Mandatory)]
         [ValidateSet('png', 'jpeg', 'pdf')]
@@ -193,12 +220,8 @@ function Assert-LocalOutputContract {
         pdf = 'html2b-poc.pdf'
     }[$Format]
 
-    if ($ContentType -ne $expectedContentType) {
-        throw "$Format returned content type '$ContentType' instead of '$expectedContentType'."
-    }
-
-    if ($FileName.Trim('"') -ne $expectedFileName) {
-        throw "$Format returned filename '$FileName' instead of '$expectedFileName'."
+    if ($ContentType -ne $expectedContentType -or $FileName.Trim('"') -ne $expectedFileName) {
+        throw "$Format output headers do not match the Render contract."
     }
 
     if ($Format -eq 'png') {
@@ -209,10 +232,9 @@ function Assert-LocalOutputContract {
             }
         }
 
-        $width = Get-BigEndianUInt32 -Bytes $Bytes -Offset 16
-        $height = Get-BigEndianUInt32 -Bytes $Bytes -Offset 20
-        if ($width -ne 1280 -or $height -ne 720) {
-            throw "PNG dimensions were ${width}x${height}, expected 1280x720."
+        if ((Get-BigEndianUInt32 -Bytes $Bytes -Offset 16) -ne 1280 -or
+            (Get-BigEndianUInt32 -Bytes $Bytes -Offset 20) -ne 720) {
+            throw 'PNG dimensions are not 1280x720.'
         }
     }
     elseif ($Format -eq 'jpeg') {
@@ -237,7 +259,6 @@ function Assert-LocalOutputContract {
             while ($offset -lt $Bytes.Length -and $Bytes[$offset] -eq 0xff) {
                 $offset++
             }
-
             if ($offset -ge $Bytes.Length) {
                 break
             }
@@ -254,12 +275,11 @@ function Assert-LocalOutputContract {
                 $width = Get-BigEndianUInt16 -Bytes $Bytes -Offset ($offset + 5)
                 break
             }
-
             $offset += $segmentLength
         }
 
         if ($width -ne 1280 -or $height -ne 720) {
-            throw "JPEG dimensions were ${width}x${height}, expected 1280x720."
+            throw 'JPEG dimensions are not 1280x720.'
         }
     }
     else {
@@ -289,26 +309,22 @@ function Assert-LocalOutputContract {
         }
 
         if (-not $validMediaBox) {
-            throw 'PDF page box validation failed; expected 960 by 540 points.'
+            throw 'PDF page box is not 960x540 points.'
         }
     }
 }
 
-function Invoke-LocalContainerValidation {
+function Invoke-LocalRenderValidation {
     param(
         [Parameter(Mandatory)]
         [string] $Image,
 
         [Parameter(Mandatory)]
-        [string] $RepositoryRoot
+        [string] $SourceCommit
     )
 
     $port = Get-AvailableTcpPort
-    $containerName = 'html2b-validation-{0}-{1}' -f (
-        (Get-SourceCommit -RepositoryRoot $RepositoryRoot).Substring(0, 12)),
-        ([guid]::NewGuid().ToString('N').Substring(0, 8))
-    $validationDirectory = Join-Path $RepositoryRoot 'build\validation\002\p01\image-local'
-    $null = [System.IO.Directory]::CreateDirectory($validationDirectory)
+    $containerName = "html2b-render-$($SourceCommit.Substring(0, 12))-$([guid]::NewGuid().ToString('N').Substring(0, 8))"
 
     try {
         $null = Invoke-Docker -Arguments @(
@@ -319,14 +335,21 @@ function Invoke-LocalContainerValidation {
             $Image
         )
         Wait-HttpReady -Uri "http://127.0.0.1:$port/health/ready"
+
         $client = [System.Net.Http.HttpClient]::new()
         $client.Timeout = [TimeSpan]::FromSeconds(60)
         try {
-            foreach ($healthPath in @('health/live', 'health/ready')) {
-                $response = $client.GetAsync("http://127.0.0.1:$port/$healthPath").GetAwaiter().GetResult()
+            foreach ($health in @(
+                    @{ Path = 'health/live'; Status = 'live' },
+                    @{ Path = 'health/ready'; Status = 'ready' })) {
+                $response = $client.GetAsync("http://127.0.0.1:$port/$($health.Path)").GetAwaiter().GetResult()
                 try {
                     if ([int] $response.StatusCode -ne 200) {
-                        throw "$healthPath returned HTTP $([int] $response.StatusCode)."
+                        throw "$($health.Path) returned HTTP $([int] $response.StatusCode)."
+                    }
+                    $payload = $response.Content.ReadAsStringAsync().GetAwaiter().GetResult() | ConvertFrom-Json
+                    if ($payload.status -ne $health.Status) {
+                        throw "$($health.Path) returned unexpected readiness state."
                     }
                 }
                 finally {
@@ -335,39 +358,41 @@ function Invoke-LocalContainerValidation {
             }
 
             foreach ($format in @('png', 'jpeg', 'pdf')) {
-                $response = $client.PostAsync(
-                    "http://127.0.0.1:$port/api/renders/$format",
-                    [System.Net.Http.HttpContent] $null).GetAwaiter().GetResult()
+                $content = [System.Net.Http.StringContent]::new(
+                    (@{ format = $format } | ConvertTo-Json -Compress),
+                    [System.Text.Encoding]::UTF8,
+                    'application/json')
                 try {
-                    if ([int] $response.StatusCode -ne 200) {
-                        throw "$format render returned HTTP $([int] $response.StatusCode)."
-                    }
+                    $response = $client.PostAsync(
+                        "http://127.0.0.1:$port/internal/renders",
+                        $content).GetAwaiter().GetResult()
+                    try {
+                        if ([int] $response.StatusCode -ne 200) {
+                            throw "$format render returned HTTP $([int] $response.StatusCode)."
+                        }
 
-                    $bytes = $response.Content.ReadAsByteArrayAsync().GetAwaiter().GetResult()
-                    $disposition = $response.Content.Headers.ContentDisposition
-                    if ($null -eq $disposition) {
-                        throw "$format render omitted Content-Disposition."
+                        $disposition = $response.Content.Headers.ContentDisposition
+                        if ($null -eq $disposition) {
+                            throw "$format render omitted Content-Disposition."
+                        }
+                        $fileName = if (-not [string]::IsNullOrWhiteSpace($disposition.FileNameStar)) {
+                            $disposition.FileNameStar
+                        }
+                        else {
+                            $disposition.FileName
+                        }
+                        Assert-RenderOutputContract `
+                            -Format $format `
+                            -Bytes ($response.Content.ReadAsByteArrayAsync().GetAwaiter().GetResult()) `
+                            -ContentType $response.Content.Headers.ContentType.MediaType `
+                            -FileName $fileName
                     }
-
-                    $fileName = if (-not [string]::IsNullOrWhiteSpace($disposition.FileNameStar)) {
-                        $disposition.FileNameStar
+                    finally {
+                        $response.Dispose()
                     }
-                    else {
-                        $disposition.FileName
-                    }
-                    Assert-LocalOutputContract `
-                        -Format $format `
-                        -Bytes $bytes `
-                        -ContentType $response.Content.Headers.ContentType.MediaType `
-                        -FileName $fileName
-
-                    $extension = if ($format -eq 'jpeg') { 'jpg' } else { $format }
-                    [System.IO.File]::WriteAllBytes(
-                        (Join-Path $validationDirectory "html2b-poc.$extension"),
-                        $bytes)
                 }
                 finally {
-                    $response.Dispose()
+                    $content.Dispose()
                 }
             }
         }
@@ -375,173 +400,264 @@ function Invoke-LocalContainerValidation {
             $client.Dispose()
         }
 
-        $configuredUser = Invoke-Docker -Arguments @(
-            'inspect', '--format', '{{.Config.User}}', $containerName)
-        if ($configuredUser -ne 'pwuser') {
-            throw "Container runs as '$configuredUser' instead of pwuser."
+        if ((Invoke-Docker -Arguments @('inspect', '--format', '{{.Config.User}}', $containerName)) -ne 'pwuser') {
+            throw 'Render container is not configured to run as pwuser.'
         }
-
-        $entryPoint = Invoke-Docker -Arguments @(
-            'inspect', '--format', '{{.Path}}', $containerName)
-        if ($entryPoint -ne '/usr/bin/tini') {
-            throw "Container PID 1 entry point is '$entryPoint' instead of /usr/bin/tini."
+        if ((Invoke-Docker -Arguments @('exec', $containerName, 'id', '-u')) -eq '0') {
+            throw 'Render container process is running as root.'
         }
-
-        $runtimeUserId = Invoke-Docker -Arguments @(
-            'exec', $containerName, 'id', '-u')
-        if ($runtimeUserId -notmatch '^\d+$' -or [int] $runtimeUserId -eq 0) {
-            throw "Container runtime user ID '$runtimeUserId' is not a non-root UID."
-        }
-
-        $pidOneProcess = Invoke-Docker -Arguments @(
-            'exec', $containerName, 'cat', '/proc/1/comm')
-        if ($pidOneProcess -ne 'tini') {
-            throw "Container PID 1 process is '$pidOneProcess' instead of tini."
+        if ((Invoke-Docker -Arguments @('exec', $containerName, 'cat', '/proc/1/comm')) -ne 'tini') {
+            throw 'Render container does not run tini as PID 1.'
         }
 
         $shutdown = [System.Diagnostics.Stopwatch]::StartNew()
         $null = Invoke-Docker -Arguments @('stop', '--time', '30', $containerName)
         $shutdown.Stop()
         if ($shutdown.Elapsed -gt [TimeSpan]::FromSeconds(35)) {
-            throw "Container shutdown exceeded 35 seconds: $($shutdown.Elapsed)."
+            throw 'Render container graceful stop exceeded 35 seconds.'
         }
     }
     finally {
-        $existingContainer = Invoke-Docker -AllowFailure -Arguments @(
+        $containerId = Invoke-Docker -AllowFailure -Arguments @(
             'container', 'inspect', '--format', '{{.Id}}', $containerName)
-        if (-not [string]::IsNullOrWhiteSpace($existingContainer)) {
+        if (-not [string]::IsNullOrWhiteSpace($containerId)) {
             $null = Invoke-Docker -Arguments @('rm', '--force', $containerName)
         }
     }
 }
 
-function Resolve-PushedImageDigest {
+function Build-RenderOciLayout {
     param(
         [Parameter(Mandatory)]
-        [string] $Registry,
+        [string] $RepositoryRoot,
 
         [Parameter(Mandatory)]
-        [string] $Repository,
+        [string] $ImageReference,
 
         [Parameter(Mandatory)]
-        [string] $Tag
+        [string] $OciLayoutPath
     )
 
-    $metadataJson = Invoke-AzureCli -Arguments @(
-        'acr', 'manifest', 'show-metadata',
-        '--registry', $Registry,
-        '--name', "${Repository}:$Tag",
-        '--only-show-errors',
-        '--output', 'json'
+    $dockerfile = Join-Path $RepositoryRoot 'src/api/Html2b.Render/Dockerfile'
+    $commonArguments = @(
+        '--file', $dockerfile,
+        '--platform', 'linux/amd64',
+        '--provenance=false',
+        '--sbom=false',
+        '--build-arg', 'BUILD_CONFIGURATION=Release',
+        $RepositoryRoot
     )
-    $metadata = $metadataJson | ConvertFrom-Json
-    $digest = [string] $metadata.digest
+
+    $null = Invoke-DockerBuildx -Arguments (@(
+        'build',
+        '--load',
+        '--tag', $ImageReference
+    ) + $commonArguments)
+
+    if (Test-Path -LiteralPath $OciLayoutPath) {
+        $resolvedLayoutPath = [System.IO.Path]::GetFullPath($OciLayoutPath)
+        if (-not $resolvedLayoutPath.Contains(
+                "$([System.IO.Path]::DirectorySeparatorChar)build$([System.IO.Path]::DirectorySeparatorChar)",
+                [System.StringComparison]::OrdinalIgnoreCase)) {
+            throw 'Refusing to replace an OCI layout outside build.'
+        }
+        Remove-Item -LiteralPath $resolvedLayoutPath -Recurse -Force
+    }
+
+    $null = Invoke-DockerBuildx -Arguments (@(
+        'build',
+        '--output', "type=oci,dest=$OciLayoutPath,tar=false"
+    ) + $commonArguments)
+}
+
+function Get-Sha256 {
+    param([Parameter(Mandatory)][string] $Path)
+    return (Get-FileHash -Algorithm SHA256 -LiteralPath $Path).Hash.ToLowerInvariant()
+}
+
+function Get-OciManifestDigest {
+    param(
+        [Parameter(Mandatory)]
+        [string] $OciLayoutPath
+    )
+
+    $indexPath = Join-Path $OciLayoutPath 'index.json'
+    if (-not (Test-Path -LiteralPath $indexPath -PathType Leaf)) {
+        throw 'OCI layout is missing index.json.'
+    }
+
+    $index = Get-Content -Raw -LiteralPath $indexPath | ConvertFrom-Json -Depth 20
+    $descriptors = @($index.manifests)
+    if ($descriptors.Count -ne 1) {
+        throw "OCI layout must contain exactly one manifest descriptor; found $($descriptors.Count)."
+    }
+
+    $digest = [string] $descriptors[0].digest
     if ($digest -cnotmatch '^sha256:[0-9a-f]{64}$') {
-        throw 'ACR returned an invalid manifest digest.'
+        throw 'OCI layout returned an invalid manifest digest.'
     }
 
-    $observedTags = if ($metadata.PSObject.Properties.Name -contains 'tags') {
-        @($metadata.tags)
-    }
-    else {
-        @([string] $metadata.name)
-    }
-    if ($observedTags -notcontains $Tag) {
-        throw "ACR manifest $digest is not tagged with the source commit $Tag."
+    $manifestPath = Join-Path $OciLayoutPath "blobs/sha256/$($digest.Substring(7))"
+    if ((Get-Sha256 -Path $manifestPath) -cne $digest.Substring(7)) {
+        throw 'OCI manifest digest does not match its retained bytes.'
     }
 
     return $digest
 }
 
-if ($RegistryName -ne 'crhtml2bdev' -or $RepositoryName -ne 'html2b-api') {
-    throw 'This feature is limited to crhtml2bdev.azurecr.io/html2b-api.'
+function Assert-LocalAndOciImagesMatch {
+    param(
+        [Parameter(Mandatory)]
+        [string] $ImageReference,
+
+        [Parameter(Mandatory)]
+        [string] $OciLayoutPath,
+
+        [Parameter(Mandatory)]
+        [string] $ManifestDigest
+    )
+
+    $localImage = Invoke-Docker -Arguments @(
+        'image', 'inspect',
+        '--format', '{{json .}}',
+        $ImageReference
+    ) | ConvertFrom-Json -Depth 30
+
+    $manifestPath = Join-Path $OciLayoutPath "blobs/sha256/$($ManifestDigest.Substring(7))"
+    $manifest = Get-Content -Raw -LiteralPath $manifestPath | ConvertFrom-Json -Depth 20
+    $configDigest = [string] $manifest.config.digest
+    if ($configDigest -cnotmatch '^sha256:[0-9a-f]{64}$') {
+        throw 'OCI manifest contains an invalid configuration digest.'
+    }
+
+    $configPath = Join-Path $OciLayoutPath "blobs/sha256/$($configDigest.Substring(7))"
+    if ((Get-Sha256 -Path $configPath) -cne $configDigest.Substring(7)) {
+        throw 'OCI configuration digest does not match its retained bytes.'
+    }
+    $config = Get-Content -Raw -LiteralPath $configPath | ConvertFrom-Json -Depth 30
+
+    if ([string] $localImage.Architecture -cne [string] $config.architecture -or
+        [string] $localImage.Os -cne [string] $config.os -or
+        [string] $localImage.Created -cne [string] $config.created) {
+        throw 'Runnable and OCI builds produced different platform or creation metadata.'
+    }
+
+    $configurationFields = @(
+        'User',
+        'ExposedPorts',
+        'Env',
+        'Entrypoint',
+        'WorkingDir',
+        'Labels',
+        'Healthcheck'
+    )
+    foreach ($field in $configurationFields) {
+        $localValue = $localImage.Config.$field | ConvertTo-Json -Depth 20 -Compress
+        $ociValue = $config.config.$field | ConvertTo-Json -Depth 20 -Compress
+        if ($localValue -cne $ociValue) {
+            throw "Runnable and OCI build configuration differs for $field."
+        }
+    }
+
+    $localLayers = @($localImage.RootFS.Layers)
+    $ociLayers = @($config.rootfs.diff_ids)
+    if ($localLayers.Count -ne $ociLayers.Count) {
+        throw 'Runnable and OCI builds produced a different layer count.'
+    }
+    for ($index = 0; $index -lt $localLayers.Count; $index++) {
+        if ([string] $localLayers[$index] -cne [string] $ociLayers[$index]) {
+            throw "Runnable and OCI build layer identity differs at index $index."
+        }
+    }
+
+    return [pscustomobject]@{
+        ConfigDigest = $configDigest
+        LayerCount = $localLayers.Count
+    }
 }
 
-if ($Push -and
-    $PSBoundParameters.ContainsKey('Confirm') -and
-    -not [bool] $PSBoundParameters['Confirm']) {
-    throw 'Image publication rejects -Confirm:$false. Interactive confirmation is required.'
+function New-RenderImageMetadata {
+    param(
+        [Parameter(Mandatory)]
+        [string] $SourceCommit,
+
+        [Parameter(Mandatory)]
+        [string] $ImageReference,
+
+        [Parameter(Mandatory)]
+        [string] $ManifestDigest,
+
+        [Parameter(Mandatory)]
+        [string] $OciLayoutPath,
+
+        [Parameter(Mandatory)]
+        [string] $ConfigDigest,
+
+        [Parameter(Mandatory)]
+        [int] $LayerCount
+    )
+
+    return [ordered]@{
+        schema = 'Html2bRenderImageMetadataV1'
+        sourceCommit = $SourceCommit
+        commitTag = $ImageReference
+        manifestDigest = $ManifestDigest
+        immutableImage = "$($ImageReference.Substring(0, $ImageReference.LastIndexOf(':')))@$ManifestDigest"
+        platform = 'linux/amd64'
+        ociLayoutPath = $OciLayoutPath
+        configDigest = $ConfigDigest
+        layerCount = $LayerCount
+        provenanceAttestationIncluded = $false
+        sbomAttestationIncluded = $false
+        createdAtUtc = [DateTimeOffset]::UtcNow.ToString('O')
+    }
 }
 
+if ($RegistryName -ne 'crhtml2bdev' -or $RepositoryName -ne 'html2b-render') {
+    throw 'This feature is limited to crhtml2bdev.azurecr.io/html2b-render.'
+}
 if (-not (Get-Command docker -ErrorAction SilentlyContinue)) {
     throw 'Docker is required.'
 }
 
 $repositoryRoot = Resolve-RepositoryRoot
-$sourceCommit = Get-SourceCommit -RepositoryRoot $repositoryRoot
-Assert-CleanImageSource -RepositoryRoot $repositoryRoot
-
+Assert-CleanRenderSource -RepositoryRoot $repositoryRoot -ExpectedCommit $SourceCommit
 $null = Invoke-Docker -Arguments @('info', '--format', '{{.ServerVersion}}')
-$imageReference = "${RegistryName}.azurecr.io/${RepositoryName}:$sourceCommit"
-$dockerfile = Join-Path $repositoryRoot 'src\api\Html2b.WebApi\Dockerfile'
-Write-Host "Building and validating $imageReference"
-$null = Invoke-Docker -Arguments @(
-    'build',
-    '--file', $dockerfile,
-    '--tag', $imageReference,
-    $repositoryRoot
-)
-Invoke-LocalContainerValidation -Image $imageReference -RepositoryRoot $repositoryRoot
+$null = Invoke-DockerBuildx -Arguments @('version')
 
-if (-not $Push) {
-    Write-Output "imageTag=$imageReference"
-    return
-}
+$renderOutputDirectory = Resolve-RenderOutputDirectory `
+    -RepositoryRoot $repositoryRoot `
+    -RequestedPath $OutputDirectory `
+    -SourceCommit $SourceCommit
+$ociLayoutPath = Join-Path $renderOutputDirectory 'oci'
+$imageReference = "${RegistryName}.azurecr.io/${RepositoryName}:$SourceCommit"
 
-if (-not (Get-Command az -ErrorAction SilentlyContinue)) {
-    throw 'Azure CLI is required for image publication.'
-}
+Build-RenderOciLayout `
+    -RepositoryRoot $repositoryRoot `
+    -ImageReference $imageReference `
+    -OciLayoutPath $ociLayoutPath
+Invoke-LocalRenderValidation -Image $imageReference -SourceCommit $SourceCommit
 
-$accountJson = Invoke-AzureCli -Arguments @(
-    'account', 'show',
-    '--query', '{name:name,id:id,tenantId:tenantId,state:state}',
-    '--output', 'json'
-)
-$account = $accountJson | ConvertFrom-Json
-if ($account.state -ne 'Enabled') {
-    throw 'The selected Azure subscription is not enabled.'
-}
+$manifestDigest = Get-OciManifestDigest -OciLayoutPath $ociLayoutPath
+$imageIdentity = Assert-LocalAndOciImagesMatch `
+    -ImageReference $imageReference `
+    -OciLayoutPath $ociLayoutPath `
+    -ManifestDigest $manifestDigest
+$metadata = New-RenderImageMetadata `
+    -SourceCommit $SourceCommit `
+    -ImageReference $imageReference `
+    -ManifestDigest $manifestDigest `
+    -OciLayoutPath $ociLayoutPath `
+    -ConfigDigest $imageIdentity.ConfigDigest `
+    -LayerCount $imageIdentity.LayerCount
+$metadataPath = Join-Path $renderOutputDirectory 'render-image.json'
+[System.IO.File]::WriteAllText(
+    $metadataPath,
+    ($metadata | ConvertTo-Json -Depth 10),
+    [System.Text.UTF8Encoding]::new($false))
 
-$registryLoginServer = Invoke-AzureCli -Arguments @(
-    'acr', 'show',
-    '--name', $RegistryName,
-    '--resource-group', 'rg-html2b-dev',
-    '--query', 'loginServer',
-    '--output', 'tsv'
-)
-if ($registryLoginServer -ne "${RegistryName}.azurecr.io") {
-    throw "Registry login server '$registryLoginServer' does not match the approved target."
-}
-
-$existingDigest = Invoke-AzureCli -AllowFailure -Arguments @(
-    'acr', 'manifest', 'show-metadata',
-        '--registry', $RegistryName,
-        '--name', "${RepositoryName}:$sourceCommit",
-        '--query', 'digest',
-        '--only-show-errors',
-        '--output', 'tsv'
-    )
-if (-not [string]::IsNullOrWhiteSpace($existingDigest)) {
-    throw "The immutable commit tag already exists as $existingDigest; refusing to retag it."
-}
-
-Write-Host "Registry: $RegistryName ($registryLoginServer)"
-Write-Host "Repository: $RepositoryName"
-Write-Host "Tag: $sourceCommit"
-Write-Host "Subscription: $($account.name) ($($account.id))"
-Write-Host 'The pushed ACR artifact is retained and may incur charges.'
-
-if (-not $PSCmdlet.ShouldProcess(
-        $imageReference,
-        'Authenticate with the current Entra identity and push this retained ACR artifact')) {
-    return
-}
-
-$null = Invoke-AzureCli -Arguments @('acr', 'login', '--name', $RegistryName)
-$null = Invoke-Docker -Arguments @('push', $imageReference)
-$digest = Resolve-PushedImageDigest `
-    -Registry $RegistryName `
-    -Repository $RepositoryName `
-    -Tag $sourceCommit
-
-Write-Output "containerImage=${RegistryName}.azurecr.io/${RepositoryName}@$digest"
+Write-Output "renderImageTag=$imageReference"
+Write-Output "renderManifestDigest=$manifestDigest"
+Write-Output "renderImage=$($metadata.immutableImage)"
+Write-Output "renderOciLayoutPath=$ociLayoutPath"
+Write-Output "renderMetadataPath=$metadataPath"

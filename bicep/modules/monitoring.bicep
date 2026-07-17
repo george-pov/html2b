@@ -1,9 +1,10 @@
 param location string
 param logAnalyticsWorkspaceName string
+param applicationInsightsName string
 param logRetentionInDays int
 param baseTags object
 
-resource logAnalyticsWorkspace 'Microsoft.OperationalInsights/workspaces@2025-02-01' = {
+resource logAnalyticsWorkspace 'Microsoft.OperationalInsights/workspaces@2026-03-01' = {
   name: logAnalyticsWorkspaceName
   location: location
   tags: union(baseTags, {
@@ -19,5 +20,22 @@ resource logAnalyticsWorkspace 'Microsoft.OperationalInsights/workspaces@2025-02
   }
 }
 
+resource applicationInsights 'Microsoft.Insights/components@2020-02-02' = {
+  name: applicationInsightsName
+  location: location
+  kind: 'web'
+  tags: union(baseTags, {
+    Component: 'Functions'
+  })
+  properties: {
+    Application_Type: 'web'
+    WorkspaceResourceId: logAnalyticsWorkspace.id
+    DisableLocalAuth: true
+    publicNetworkAccessForIngestion: 'Enabled'
+    publicNetworkAccessForQuery: 'Enabled'
+  }
+}
+
 output logAnalyticsWorkspaceId string = logAnalyticsWorkspace.id
-output logAnalyticsWorkspaceName string = logAnalyticsWorkspace.name
+output applicationInsightsId string = applicationInsights.id
+output applicationInsightsConnectionString string = applicationInsights.properties.ConnectionString

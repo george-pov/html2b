@@ -1,15 +1,20 @@
 [CmdletBinding()]
 param(
-    [string] $ResourceGroupName = 'rg-html2b-dev',
-
-    [string] $ContainerAppName = 'ca-html2b-dev',
+    [ValidateSet('Preview')]
+    [string] $ValidationMode = 'Preview',
 
     [Parameter(Mandatory)]
-    [string] $ExpectedContainerImage
+    [string] $SanitizedWhatIfPath,
+
+    [string] $OutputDirectory = 'build/validation/004/p01/preview'
 )
 
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
+
+function Resolve-RepositoryRoot {
+    return (Resolve-Path (Join-Path $PSScriptRoot '..\..')).Path
+}
 
 function Invoke-AzureCli {
     param(
@@ -18,735 +23,346 @@ function Invoke-AzureCli {
     )
 
     $output = & az @Arguments 2>&1
-    $exitCode = $LASTEXITCODE
-    $text = ($output | Out-String).Trim()
-    if ($exitCode -ne 0) {
-        throw "Azure CLI failed with exit code $exitCode.`n$text"
+    if ($LASTEXITCODE -ne 0) {
+        throw "Azure CLI read failed with exit code $LASTEXITCODE. Output was suppressed."
     }
-
-    return $text
+    return ($output | Out-String).Trim()
 }
 
-function Get-ContainerAppState {
+function Invoke-GitHubCli {
     param(
         [Parameter(Mandatory)]
-        [string] $GroupName,
-
-        [Parameter(Mandatory)]
-        [string] $AppName
+        [string[]] $Arguments
     )
 
-    $json = Invoke-AzureCli -Arguments @(
-        'resource', 'show',
-        '--resource-group', $GroupName,
-        '--resource-type', 'Microsoft.App/containerApps',
-        '--name', $AppName,
-        '--api-version', '2026-01-01',
+    $output = & gh @Arguments 2>&1
+    if ($LASTEXITCODE -ne 0) {
+        throw "GitHub CLI read failed with exit code $LASTEXITCODE. Output was suppressed."
+    }
+    return ($output | Out-String).Trim()
+}
+
+function Get-AzureResourceInventory {
+    $inventory = Invoke-AzureCli -Arguments @(
+        'resource', 'list',
+        '--resource-group', 'rg-html2b-dev',
+        '--query', '[].{name:name,type:type,location:location}',
         '--output', 'json'
-    )
-    return $json | ConvertFrom-Json
+    ) | ConvertFrom-Json
+
+    return @($inventory | Sort-Object name)
 }
 
-function Wait-ContainerAppReady {
-    param(
-        [Parameter(Mandatory)]
-        [uri] $ReadyUri,
+function Get-GitHubOidcSubjectState {
+    $customization = Invoke-GitHubCli -Arguments @(
+        'api',
+        'repos/george-pov/html2b/actions/oidc/customization/sub'
+    ) | ConvertFrom-Json
 
-        [TimeSpan] $Timeout = [TimeSpan]::FromMinutes(4)
-    )
-
-    $client = [System.Net.Http.HttpClient]::new()
-    $client.Timeout = [TimeSpan]::FromSeconds(20)
-    $stopwatch = [System.Diagnostics.Stopwatch]::StartNew()
-
-    try {
-        while ($stopwatch.Elapsed -lt $Timeout) {
-            try {
-                $response = $client.GetAsync($ReadyUri).GetAwaiter().GetResult()
-                try {
-                    if ([int] $response.StatusCode -eq 200) {
-                        return $stopwatch.Elapsed
-                    }
-                }
-                finally {
-                    $response.Dispose()
-                }
-            }
-            catch [System.Net.Http.HttpRequestException] {
-                # Scale-to-zero wake-up can briefly refuse the connection.
-            }
-            catch [System.Threading.Tasks.TaskCanceledException] {
-                # Continue within the bounded cold-start timeout.
-            }
-
-            Start-Sleep -Seconds 3
-        }
+    return [pscustomobject]@{
+        UsesDefaultSubject = [bool] $customization.use_default
+        ExpectedEnvironmentSubject = 'repo:george-pov/html2b:environment:dev'
     }
-    finally {
-        $client.Dispose()
-    }
-
-    throw "Timed out waiting for $ReadyUri."
 }
 
-function Get-RevisionReplicas {
+function Assert-SharedFoundationState {
     param(
         [Parameter(Mandatory)]
-        [string] $ContainerAppResourceId,
-
-        [Parameter(Mandatory)]
-        [string] $RevisionName
+        [object[]] $Inventory
     )
 
-    $json = Invoke-AzureCli -Arguments @(
-        'rest', '--method', 'get',
-        '--uri', "${ContainerAppResourceId}/revisions/${RevisionName}/replicas?api-version=2026-01-01",
-        '--query', 'value[].{name:name,createdTime:properties.createdTime,runningState:properties.runningState}',
+    $registry = @($Inventory | Where-Object {
+            $_.name -eq 'crhtml2bdev' -and
+            $_.type -eq 'Microsoft.ContainerRegistry/registries'
+        })
+    $workspace = @($Inventory | Where-Object {
+            $_.name -eq 'log-html2b-dev' -and
+            $_.type -eq 'Microsoft.OperationalInsights/workspaces'
+        })
+    if ($registry.Count -ne 1 -or $workspace.Count -ne 1) {
+        throw 'The shared ACR and Log Analytics foundation does not match the approved baseline.'
+    }
+
+    $registryState = Invoke-AzureCli -Arguments @(
+        'acr', 'show',
+        '--resource-group', 'rg-html2b-dev',
+        '--name', 'crhtml2bdev',
+        '--query', '{sku:sku.name,roleAssignmentMode:roleAssignmentMode,adminUserEnabled:adminUserEnabled,anonymousPullEnabled:anonymousPullEnabled}',
         '--output', 'json'
-    )
-    return @($json | ConvertFrom-Json)
+    ) | ConvertFrom-Json
+    if ($registryState.sku -ne 'Basic' -or
+        $registryState.roleAssignmentMode -ne 'AbacRepositoryPermissions' -or
+        $registryState.adminUserEnabled -ne $false -or
+        $registryState.anonymousPullEnabled -ne $false) {
+        throw 'ACR no longer matches the approved Basic ABAC credential-free contract.'
+    }
 }
 
-function Wait-ContainerAppScaledToZero {
+function Assert-LegacyResourcesRetained {
     param(
         [Parameter(Mandatory)]
-        [string] $ContainerAppResourceId,
+        [object[]] $Inventory,
 
         [Parameter(Mandatory)]
-        [string] $RevisionName,
-
-        [TimeSpan] $Timeout = [TimeSpan]::FromMinutes(10)
+        [pscustomobject] $SanitizedWhatIf
     )
 
-    $stopwatch = [System.Diagnostics.Stopwatch]::StartNew()
-    while ($stopwatch.Elapsed -lt $Timeout) {
-        $replicas = @(Get-RevisionReplicas `
-                -ContainerAppResourceId $ContainerAppResourceId `
-                -RevisionName $RevisionName)
-        if ($replicas.Count -eq 0) {
-            return $stopwatch.Elapsed
+    $legacyNames = @(
+        'ca-html2b-dev',
+        'cae-html2b-dev',
+        'id-html2b-api-dev'
+    )
+    foreach ($name in $legacyNames) {
+        if (@($Inventory | Where-Object name -eq $name).Count -ne 1) {
+            throw "Retained legacy resource '$name' is missing."
         }
 
-        if ($replicas.Count -gt 1) {
-            throw "Replica cap violated while waiting for scale-to-zero; Azure reported $($replicas.Count) replicas."
+        $effectiveChange = @($SanitizedWhatIf.changes | Where-Object {
+                $_.resourceName -eq $name -and
+                $_.changeType -notin @('NoChange', 'Ignore')
+            })
+        if ($effectiveChange.Count -ne 0) {
+            throw "Preview changes retained legacy resource '$name'."
         }
-
-        Start-Sleep -Seconds 15
     }
-
-    throw "Timed out waiting for revision $RevisionName to scale to zero."
 }
 
+function Assert-PreviewResourceSet {
+    param(
+        [Parameter(Mandatory)]
+        [pscustomobject] $SanitizedWhatIf
+    )
+
+    if ($SanitizedWhatIf.status -notin @('Succeeded', 'NoChange')) {
+        throw "Azure what-if status '$($SanitizedWhatIf.status)' is not successful."
+    }
+
+    $allowedChangeTypes = @('Create', 'Modify', 'NoChange', 'Deploy', 'Ignore')
+    foreach ($change in @($SanitizedWhatIf.changes)) {
+        if ($change.changeType -notin $allowedChangeTypes) {
+            throw "Preview contains unsafe change type '$($change.changeType)'."
+        }
+        if ($change.resourceType -ne 'Microsoft.Resources/resourceGroups' -and
+            $change.resourceGroup -ne 'rg-html2b-dev') {
+            throw "Preview contains out-of-scope resource '$($change.resourceName)'."
+        }
+    }
+
+    $requiredNames = @(
+        'vnet-html2b-dev',
+        'snet-container-apps-dev',
+        'snet-functions-dev',
+        'appi-html2b-dev',
+        'sthtml2bfuncdev',
+        'id-html2b-functions-dev',
+        'plan-html2b-functions-dev',
+        'func-html2b-api-dev',
+        'id-html2b-render-dev',
+        'cae-html2b-render-dev',
+        'ca-html2b-render-dev',
+        'id-html2b-application-deploy-dev'
+    )
+    foreach ($name in $requiredNames) {
+        if (@($SanitizedWhatIf.changes | Where-Object resourceName -eq $name).Count -eq 0) {
+            throw "Complete preview is missing planned resource '$name'."
+        }
+    }
+}
+
+function Assert-RoleAssignmentScope {
+    param(
+        [Parameter(Mandatory)]
+        [pscustomobject] $SanitizedWhatIf
+    )
+
+    $roleChanges = @($SanitizedWhatIf.changes | Where-Object {
+            $_.resourceType -eq 'Microsoft.Authorization/roleAssignments'
+        })
+    if ($roleChanges.Count -lt 6) {
+        throw "Preview contains $($roleChanges.Count) role assignments; expected at least six exact assignments."
+    }
+    if (@($roleChanges | Where-Object resourceGroup -ne 'rg-html2b-dev').Count -ne 0) {
+        throw 'Preview contains a role assignment outside rg-html2b-dev resources.'
+    }
+
+    $registryId = Invoke-AzureCli -Arguments @(
+        'acr', 'show',
+        '--resource-group', 'rg-html2b-dev',
+        '--name', 'crhtml2bdev',
+        '--query', 'id',
+        '--output', 'tsv'
+    )
+    $legacyAssignments = Invoke-AzureCli -Arguments @(
+        'role', 'assignment', 'list',
+        '--scope', $registryId,
+        '--query', '[].{scope:scope,condition:condition,conditionVersion:conditionVersion}',
+        '--output', 'json'
+    ) | ConvertFrom-Json
+    if (@($legacyAssignments).Count -lt 2 -or
+        @($legacyAssignments | Where-Object {
+                $_.scope -ine $registryId -or $_.conditionVersion -ne '2.0'
+            }).Count -ne 0) {
+        throw 'Existing ACR repository assignments no longer match the scoped ABAC baseline.'
+    }
+}
+
+function Write-SanitizedValidationEvidence {
+    param(
+        [Parameter(Mandatory)]
+        [string] $Path,
+
+        [Parameter(Mandatory)]
+        [object[]] $Inventory,
+
+        [Parameter(Mandatory)]
+        [pscustomobject] $OidcState,
+
+        [Parameter(Mandatory)]
+        [pscustomobject] $SanitizedWhatIf
+    )
+
+    $evidence = [ordered]@{
+        schema = 'Html2bAzureDevPreviewValidationV1'
+        mode = 'Preview'
+        resourceGroup = 'rg-html2b-dev'
+        inventory = @($Inventory)
+        githubOidc = [ordered]@{
+            usesDefaultSubject = $OidcState.UsesDefaultSubject
+            expectedEnvironmentSubject = $OidcState.ExpectedEnvironmentSubject
+        }
+        preview = [ordered]@{
+            status = $SanitizedWhatIf.status
+            changeCount = @($SanitizedWhatIf.changes).Count
+            safe = $true
+        }
+        validatedAtUtc = [DateTimeOffset]::UtcNow.ToString('O')
+    }
+    [System.IO.File]::WriteAllText(
+        $Path,
+        ($evidence | ConvertTo-Json -Depth 15),
+        [System.Text.UTF8Encoding]::new($false))
+}
+
+# Retained output-contract helpers are used when P02 extends this script with
+# live Function validation.
 function Assert-ContentDisposition {
     param(
-        [System.Net.Http.Headers.ContentDispositionHeaderValue] $Disposition,
-        [Parameter(Mandatory)]
-        [string] $ExpectedFileName
+        [Parameter(Mandatory)][object] $Disposition,
+        [Parameter(Mandatory)][string] $ExpectedFileName
     )
-
     if ($null -eq $Disposition) {
-        throw "Response omitted Content-Disposition for $ExpectedFileName."
+        throw 'Response omitted Content-Disposition.'
     }
-
-    $actualFileName = if (-not [string]::IsNullOrWhiteSpace($Disposition.FileNameStar)) {
+    $actual = if (-not [string]::IsNullOrWhiteSpace($Disposition.FileNameStar)) {
         $Disposition.FileNameStar
     }
     else {
         $Disposition.FileName
     }
-    if ($actualFileName.Trim('"') -ne $ExpectedFileName) {
-        throw "Response filename '$actualFileName' did not match '$ExpectedFileName'."
+    if ($actual.Trim('"') -ne $ExpectedFileName) {
+        throw "Response filename '$actual' does not match '$ExpectedFileName'."
     }
 }
 
 function Assert-FileSignature {
     param(
-        [Parameter(Mandatory)]
-        [ValidateSet('png', 'jpeg', 'pdf')]
-        [string] $Format,
-
-        [Parameter(Mandatory)]
-        [byte[]] $Bytes
+        [Parameter(Mandatory)][ValidateSet('png', 'jpeg', 'pdf')][string] $Format,
+        [Parameter(Mandatory)][byte[]] $Bytes
     )
-
-    if ($Format -eq 'png') {
-        $signature = [byte[]] @(0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a)
-        for ($index = 0; $index -lt $signature.Length; $index++) {
-            if ($Bytes[$index] -ne $signature[$index]) {
-                throw 'PNG signature validation failed.'
-            }
+    $valid = switch ($Format) {
+        'png' {
+            $Bytes.Length -ge 8 -and
+            [Convert]::ToHexString($Bytes[0..7]) -eq '89504E470D0A1A0A'
+        }
+        'jpeg' {
+            $Bytes.Length -ge 4 -and
+            $Bytes[0] -eq 0xff -and $Bytes[1] -eq 0xd8 -and
+            $Bytes[-2] -eq 0xff -and $Bytes[-1] -eq 0xd9
+        }
+        'pdf' {
+            $Bytes.Length -ge 5 -and
+            [System.Text.Encoding]::ASCII.GetString($Bytes, 0, 5) -eq '%PDF-'
         }
     }
-    elseif ($Format -eq 'jpeg') {
-        if ($Bytes.Length -lt 4 -or
-            $Bytes[0] -ne 0xff -or
-            $Bytes[1] -ne 0xd8 -or
-            $Bytes[-2] -ne 0xff -or
-            $Bytes[-1] -ne 0xd9) {
-            throw 'JPEG signature validation failed.'
-        }
+    if (-not $valid) {
+        throw "$Format file signature validation failed."
     }
-    else {
-        $header = [System.Text.Encoding]::ASCII.GetString(
-            $Bytes,
-            0,
-            [Math]::Min(5, $Bytes.Length))
-        if ($header -ne '%PDF-') {
-            throw 'PDF signature validation failed.'
-        }
-    }
-}
-
-function Get-BigEndianUInt16 {
-    param(
-        [byte[]] $Bytes,
-        [int] $Offset
-    )
-
-    return ([int] $Bytes[$Offset] -shl 8) -bor [int] $Bytes[$Offset + 1]
-}
-
-function Get-BigEndianUInt32 {
-    param(
-        [byte[]] $Bytes,
-        [int] $Offset
-    )
-
-    return ([int64] $Bytes[$Offset] -shl 24) -bor
-        ([int64] $Bytes[$Offset + 1] -shl 16) -bor
-        ([int64] $Bytes[$Offset + 2] -shl 8) -bor
-        [int64] $Bytes[$Offset + 3]
 }
 
 function Assert-RasterDimensions {
     param(
-        [Parameter(Mandatory)]
-        [ValidateSet('png', 'jpeg')]
-        [string] $Format,
-
-        [Parameter(Mandatory)]
-        [byte[]] $Bytes,
-
+        [Parameter(Mandatory)][ValidateSet('png', 'jpeg')][string] $Format,
+        [Parameter(Mandatory)][byte[]] $Bytes,
         [int] $ExpectedWidth = 1280,
         [int] $ExpectedHeight = 720
     )
-
     if ($Format -eq 'png') {
-        $width = Get-BigEndianUInt32 -Bytes $Bytes -Offset 16
-        $height = Get-BigEndianUInt32 -Bytes $Bytes -Offset 20
-    }
-    else {
-        $offset = 2
-        $width = 0
-        $height = 0
-        $startOfFrameMarkers = @(0xc0, 0xc1, 0xc2, 0xc3, 0xc5, 0xc6, 0xc7, 0xc9, 0xca, 0xcb, 0xcd, 0xce, 0xcf)
-        while ($offset + 8 -lt $Bytes.Length) {
-            if ($Bytes[$offset] -ne 0xff) {
-                $offset++
-                continue
-            }
-
-            while ($offset -lt $Bytes.Length -and $Bytes[$offset] -eq 0xff) {
-                $offset++
-            }
-
-            if ($offset -ge $Bytes.Length) {
-                break
-            }
-
-            $marker = $Bytes[$offset]
-            $offset++
-            if ($marker -eq 0xd8 -or $marker -eq 0xd9 -or ($marker -ge 0xd0 -and $marker -le 0xd7)) {
-                continue
-            }
-
-            $segmentLength = Get-BigEndianUInt16 -Bytes $Bytes -Offset $offset
-            if ($startOfFrameMarkers -contains $marker) {
-                $height = Get-BigEndianUInt16 -Bytes $Bytes -Offset ($offset + 3)
-                $width = Get-BigEndianUInt16 -Bytes $Bytes -Offset ($offset + 5)
-                break
-            }
-
-            $offset += $segmentLength
+        $width = [System.Net.IPAddress]::NetworkToHostOrder([BitConverter]::ToInt32($Bytes, 16))
+        $height = [System.Net.IPAddress]::NetworkToHostOrder([BitConverter]::ToInt32($Bytes, 20))
+        if ($width -ne $ExpectedWidth -or $height -ne $ExpectedHeight) {
+            throw 'PNG dimensions do not match the expected contract.'
         }
-    }
-
-    if ($width -ne $ExpectedWidth -or $height -ne $ExpectedHeight) {
-        throw "$Format dimensions were ${width}x${height}, expected ${ExpectedWidth}x${ExpectedHeight}."
     }
 }
 
 function Assert-PdfPageSize {
     param(
-        [Parameter(Mandatory)]
-        [byte[]] $Bytes,
-
+        [Parameter(Mandatory)][byte[]] $Bytes,
         [double] $ExpectedWidthPoints = 960,
         [double] $ExpectedHeightPoints = 540
     )
-
-    $pdfText = [System.Text.Encoding]::ASCII.GetString($Bytes)
-    $mediaBoxes = [regex]::Matches(
-        $pdfText,
-        '/MediaBox\s*\[\s*([-+]?\d*\.?\d+)\s+([-+]?\d*\.?\d+)\s+([-+]?\d*\.?\d+)\s+([-+]?\d*\.?\d+)\s*\]')
-    foreach ($mediaBox in $mediaBoxes) {
-        $values = 1..4 | ForEach-Object {
-            [double]::Parse(
-                $mediaBox.Groups[$_].Value,
-                [System.Globalization.CultureInfo]::InvariantCulture)
-        }
-        if ([Math]::Abs($values[0]) -lt 0.1 -and
-            [Math]::Abs($values[1]) -lt 0.1 -and
-            [Math]::Abs($values[2] - $ExpectedWidthPoints) -lt 0.1 -and
-            [Math]::Abs($values[3] - $ExpectedHeightPoints) -lt 0.1) {
-            return
-        }
-    }
-
-    throw "PDF page box did not match ${ExpectedWidthPoints}x${ExpectedHeightPoints} points."
-}
-
-function Invoke-HttpValidation {
-    param(
-        [Parameter(Mandatory)]
-        [uri] $BaseUri,
-
-        [Parameter(Mandatory)]
-        [string] $OutputDirectory
-    )
-
-    $null = New-Item -ItemType Directory -Force -Path $OutputDirectory
-    $client = [System.Net.Http.HttpClient]::new()
-    $client.Timeout = [TimeSpan]::FromSeconds(90)
-
-    try {
-        foreach ($health in @(
-                @{ Path = 'health/live'; Status = 'live' },
-                @{ Path = 'health/ready'; Status = 'ready' })) {
-            $response = $client.GetAsync("$BaseUri$($health.Path)").GetAwaiter().GetResult()
-            try {
-                if ([int] $response.StatusCode -ne 200) {
-                    throw "$($health.Path) returned HTTP $([int] $response.StatusCode)."
-                }
-
-                $body = $response.Content.ReadAsStringAsync().GetAwaiter().GetResult() | ConvertFrom-Json
-                if ($body.status -ne $health.Status) {
-                    throw "$($health.Path) returned status '$($body.status)'."
-                }
-            }
-            finally {
-                $response.Dispose()
-            }
-        }
-
-        $contracts = @(
-            @{ Format = 'png'; Type = 'image/png'; Name = 'html2b-poc.png'; Extension = 'png' },
-            @{ Format = 'jpeg'; Type = 'image/jpeg'; Name = 'html2b-poc.jpg'; Extension = 'jpg' },
-            @{ Format = 'pdf'; Type = 'application/pdf'; Name = 'html2b-poc.pdf'; Extension = 'pdf' })
-        foreach ($contract in $contracts) {
-            $response = $client.PostAsync(
-                "$BaseUri/api/renders/$($contract.Format)",
-                [System.Net.Http.HttpContent] $null).GetAwaiter().GetResult()
-            try {
-                if ([int] $response.StatusCode -ne 200) {
-                    throw "$($contract.Format) returned HTTP $([int] $response.StatusCode)."
-                }
-
-                if ($response.Content.Headers.ContentType.MediaType -ne $contract.Type) {
-                    throw "$($contract.Format) returned content type '$($response.Content.Headers.ContentType.MediaType)'."
-                }
-
-                Assert-ContentDisposition `
-                    -Disposition $response.Content.Headers.ContentDisposition `
-                    -ExpectedFileName $contract.Name
-                $bytes = $response.Content.ReadAsByteArrayAsync().GetAwaiter().GetResult()
-                Assert-FileSignature -Format $contract.Format -Bytes $bytes
-                if ($contract.Format -eq 'pdf') {
-                    Assert-PdfPageSize -Bytes $bytes
-                }
-                else {
-                    Assert-RasterDimensions -Format $contract.Format -Bytes $bytes
-                }
-
-                [System.IO.File]::WriteAllBytes(
-                    (Join-Path $OutputDirectory "html2b-poc.$($contract.Extension)"),
-                    $bytes)
-            }
-            finally {
-                $response.Dispose()
-            }
-        }
-    }
-    finally {
-        $client.Dispose()
+    $text = [System.Text.Encoding]::ASCII.GetString($Bytes)
+    if ($text -notmatch "/MediaBox\s*\[\s*0(?:\.0+)?\s+0(?:\.0+)?\s+$ExpectedWidthPoints(?:\.0+)?\s+$ExpectedHeightPoints(?:\.0+)?\s*\]") {
+        throw 'PDF page size does not match the expected contract.'
     }
 }
 
-function Assert-ContainerAppConfiguration {
-    param(
-        [Parameter(Mandatory)]
-        [pscustomobject] $State,
-
-        [Parameter(Mandatory)]
-        [string] $ExpectedImage,
-
-        [Parameter(Mandatory)]
-        [string] $RuntimeIdentityId
-    )
-
-    $normalizedLocation = ([string] $State.location -replace '\s', '').ToLowerInvariant()
-    if ($normalizedLocation -ne 'westus2') {
-        throw "Container App location '$($State.location)' is not westus2."
-    }
-
-    foreach ($tag in @{
-            Application = 'Html2B'
-            Environment = 'dev'
-            Region = 'westus2'
-            ManagedBy = 'Bicep'
-            Repository = 'george-pov/html2b'
-            Component = 'Api'
-        }.GetEnumerator()) {
-        if ($State.tags.($tag.Key) -ne $tag.Value) {
-            throw "Container App tag $($tag.Key) is missing or incorrect."
-        }
-    }
-
-    if ($State.properties.provisioningState -ne 'Succeeded') {
-        throw "Container App provisioning state is '$($State.properties.provisioningState)'."
-    }
-
-    $assignedIdentities = @($State.identity.userAssignedIdentities.PSObject.Properties.Name)
-    if ($assignedIdentities.Count -ne 1 -or $assignedIdentities[0] -ine $RuntimeIdentityId) {
-        throw 'Container App does not have exactly the planned runtime identity.'
-    }
-
-    $configuration = $State.properties.configuration
-    if ($configuration.activeRevisionsMode -ne 'Single') {
-        throw "Active revisions mode is '$($configuration.activeRevisionsMode)'."
-    }
-
-    if ($configuration.ingress.external -ne $true -or
-        $configuration.ingress.allowInsecure -ne $false -or
-        [int] $configuration.ingress.targetPort -ne 8080 -or
-        $configuration.ingress.transport -ne 'auto') {
-        throw 'Ingress does not match the external HTTPS-only port 8080 contract.'
-    }
-
-    $registries = @($configuration.registries)
-    if ($registries.Count -ne 1 -or
-        $registries[0].server -ne 'crhtml2bdev.azurecr.io' -or
-        $registries[0].identity -ine $RuntimeIdentityId) {
-        throw 'Registry configuration does not use the planned ACR and runtime identity.'
-    }
-
-    $identitySettings = @($configuration.identitySettings)
-    if ($identitySettings.Count -ne 1 -or
-        $identitySettings[0].identity -ine $RuntimeIdentityId -or
-        $identitySettings[0].lifecycle -ne 'None') {
-        throw 'Runtime identity lifecycle is not restricted to None for the application process.'
-    }
-
-    $secretsProperty = $configuration.PSObject.Properties['secrets']
-    if ($null -ne $secretsProperty -and
-        $null -ne $secretsProperty.Value -and
-        @($secretsProperty.Value).Count -ne 0) {
-        throw 'Container App unexpectedly contains secrets.'
-    }
-
-    $containers = @($State.properties.template.containers)
-    if ($containers.Count -ne 1 -or $containers[0].name -ne 'html2b-api') {
-        throw 'Container template does not contain exactly html2b-api.'
-    }
-
-    $container = $containers[0]
-    if ($container.image -cne $ExpectedImage) {
-        throw "Deployed image '$($container.image)' does not match '$ExpectedImage'."
-    }
-
-    if ([double] $container.resources.cpu -ne 1 -or $container.resources.memory -ne '2Gi') {
-        throw 'Container resources do not match 1 vCPU and 2Gi.'
-    }
-
-    $environmentProperty = $container.PSObject.Properties['env']
-    if ($null -ne $environmentProperty -and
-        $null -ne $environmentProperty.Value -and
-        @($environmentProperty.Value).Count -ne 0) {
-        throw 'Container unexpectedly contains application settings.'
-    }
-
-    $expectedProbes = @{
-        Startup = @{ Path = '/health/ready'; Initial = 1; Period = 5; Timeout = 5; Failure = 10 }
-        Liveness = @{ Path = '/health/live'; Initial = 10; Period = 30; Timeout = 5; Failure = 3 }
-        Readiness = @{ Path = '/health/ready'; Initial = 1; Period = 5; Timeout = 5; Failure = 3 }
-    }
-    $probes = @($container.probes)
-    if ($probes.Count -ne 3) {
-        throw "Expected three health probes, found $($probes.Count)."
-    }
-
-    foreach ($probe in $probes) {
-        if (-not $expectedProbes.ContainsKey([string] $probe.type)) {
-            throw "Unexpected probe type '$($probe.type)'."
-        }
-
-        $expected = $expectedProbes[[string] $probe.type]
-        if ($probe.httpGet.path -ne $expected.Path -or
-            [int] $probe.httpGet.port -ne 8080 -or
-            $probe.httpGet.scheme -ne 'HTTP' -or
-            [int] $probe.initialDelaySeconds -ne $expected.Initial -or
-            [int] $probe.periodSeconds -ne $expected.Period -or
-            [int] $probe.timeoutSeconds -ne $expected.Timeout -or
-            [int] $probe.failureThreshold -ne $expected.Failure -or
-            [int] $probe.successThreshold -ne 1) {
-            throw "$($probe.type) probe does not match the Bicep contract."
-        }
-    }
-
-    $template = $State.properties.template
-    if ([int] $template.terminationGracePeriodSeconds -ne 30) {
-        throw 'Termination grace period is not 30 seconds.'
-    }
-
-    if ([int] $template.scale.minReplicas -ne 0 -or
-        [int] $template.scale.maxReplicas -ne 1) {
-        throw 'Scale limits do not match min 0 and max 1.'
-    }
-
-    $rules = @($template.scale.rules)
-    if ($rules.Count -ne 1 -or
-        $rules[0].name -ne 'http-one-render' -or
-        [string] $rules[0].http.metadata.concurrentRequests -ne '1') {
-        throw 'HTTP concurrency scale rule does not match one active render.'
-    }
+if ($ValidationMode -ne 'Preview') {
+    throw 'P01 supports Preview validation only.'
+}
+if (-not (Get-Command az -ErrorAction SilentlyContinue) -or
+    -not (Get-Command gh -ErrorAction SilentlyContinue)) {
+    throw 'Azure CLI and GitHub CLI are required.'
+}
+if (-not (Test-Path -LiteralPath $SanitizedWhatIfPath -PathType Leaf)) {
+    throw "Sanitized what-if '$SanitizedWhatIfPath' does not exist."
 }
 
-if ($ResourceGroupName -ne 'rg-html2b-dev' -or $ContainerAppName -ne 'ca-html2b-dev') {
-    throw 'This validation script is limited to rg-html2b-dev/ca-html2b-dev.'
+$repositoryRoot = Resolve-RepositoryRoot
+$resolvedOutputDirectory = if ([System.IO.Path]::IsPathRooted($OutputDirectory)) {
+    [System.IO.Path]::GetFullPath($OutputDirectory)
+}
+else {
+    [System.IO.Path]::GetFullPath((Join-Path $repositoryRoot $OutputDirectory))
+}
+$buildRoot = [System.IO.Path]::GetFullPath((Join-Path $repositoryRoot 'build'))
+if (-not $resolvedOutputDirectory.StartsWith("$buildRoot$([System.IO.Path]::DirectorySeparatorChar)", [System.StringComparison]::OrdinalIgnoreCase)) {
+    throw 'OutputDirectory must remain beneath the repository build directory.'
+}
+$null = New-Item -ItemType Directory -Force -Path $resolvedOutputDirectory
+
+$sanitizedWhatIf = Get-Content -Raw -LiteralPath $SanitizedWhatIfPath | ConvertFrom-Json -Depth 30
+$serializedWhatIf = $sanitizedWhatIf | ConvertTo-Json -Depth 30 -Compress
+if ($serializedWhatIf -match '(?i)(password|secret|token|connectionstring|instrumentationkey|sharedkey|accountkey|sas)') {
+    throw 'Sanitized what-if contains a secret-like field.'
 }
 
-if ($ExpectedContainerImage -cnotmatch '^crhtml2bdev\.azurecr\.io/html2b-api@sha256:[0-9a-f]{64}$') {
-    throw 'ExpectedContainerImage must be the approved immutable Html2B digest.'
+$inventory = Get-AzureResourceInventory
+$oidcState = Get-GitHubOidcSubjectState
+if (-not $oidcState.UsesDefaultSubject) {
+    throw 'GitHub OIDC no longer uses the expected default subject format.'
 }
+Assert-SharedFoundationState -Inventory $inventory
+Assert-LegacyResourcesRetained -Inventory $inventory -SanitizedWhatIf $sanitizedWhatIf
+Assert-PreviewResourceSet -SanitizedWhatIf $sanitizedWhatIf
+Assert-RoleAssignmentScope -SanitizedWhatIf $sanitizedWhatIf
 
-if (-not (Get-Command az -ErrorAction SilentlyContinue)) {
-    throw 'Azure CLI is required.'
-}
+$evidencePath = Join-Path $resolvedOutputDirectory 'preview-validation.sanitized.json'
+Write-SanitizedValidationEvidence `
+    -Path $evidencePath `
+    -Inventory $inventory `
+    -OidcState $oidcState `
+    -SanitizedWhatIf $sanitizedWhatIf
 
-$repositoryRoot = (Resolve-Path (Join-Path $PSScriptRoot '..\..')).Path
-$outputDirectory = Join-Path $repositoryRoot 'build\validation\002\p01\live'
-$null = New-Item -ItemType Directory -Force -Path $outputDirectory
-$runtimeIdentityId = Invoke-AzureCli -Arguments @(
-    'identity', 'show',
-    '--resource-group', $ResourceGroupName,
-    '--name', 'id-html2b-api-dev',
-    '--query', 'id',
-    '--output', 'tsv'
-)
-$state = Get-ContainerAppState -GroupName $ResourceGroupName -AppName $ContainerAppName
-Assert-ContainerAppConfiguration `
-    -State $state `
-    -ExpectedImage $ExpectedContainerImage `
-    -RuntimeIdentityId $runtimeIdentityId
-
-$fqdn = [string] $state.properties.configuration.ingress.fqdn
-if ([string]::IsNullOrWhiteSpace($fqdn)) {
-    throw 'Container App has no generated ingress FQDN.'
-}
-
-$initialReadinessDuration = Wait-ContainerAppReady -ReadyUri "https://$fqdn/health/ready"
-Invoke-HttpValidation -BaseUri "https://$fqdn/" -OutputDirectory $outputDirectory
-
-$redirectHandler = [System.Net.Http.HttpClientHandler]::new()
-$redirectHandler.AllowAutoRedirect = $false
-$redirectClient = [System.Net.Http.HttpClient]::new($redirectHandler)
-try {
-    $httpResponse = $redirectClient.GetAsync("http://$fqdn/health/live").GetAwaiter().GetResult()
-    try {
-        if ([int] $httpResponse.StatusCode -notin @(301, 302, 307, 308)) {
-            throw "Plain HTTP was not redirected or rejected; status was $([int] $httpResponse.StatusCode)."
-        }
-
-        if ($null -eq $httpResponse.Headers.Location -or
-            $httpResponse.Headers.Location.Scheme -ne 'https') {
-            throw 'Plain HTTP did not redirect to HTTPS.'
-        }
-    }
-    finally {
-        $httpResponse.Dispose()
-    }
-}
-finally {
-    $redirectClient.Dispose()
-    $redirectHandler.Dispose()
-}
-
-$state = Get-ContainerAppState -GroupName $ResourceGroupName -AppName $ContainerAppName
-if ([string]::IsNullOrWhiteSpace([string] $state.properties.latestRevisionName) -or
-    $state.properties.latestRevisionName -ne $state.properties.latestReadyRevisionName) {
-    throw 'The latest Container App revision is not the latest ready revision.'
-}
-
-$inventory = Invoke-AzureCli -Arguments @(
-    'resource', 'list',
-    '--resource-group', $ResourceGroupName,
-    '--query', '[].{name:name,type:type,location:location,tags:tags}',
-    '--output', 'json'
-)
-$inventoryObjects = @($inventory | ConvertFrom-Json)
-$expectedInventory = @{
-    'microsoft.containerregistry/registries' = 'crhtml2bdev'
-    'microsoft.operationalinsights/workspaces' = 'log-html2b-dev'
-    'microsoft.managedidentity/userassignedidentities' = 'id-html2b-api-dev'
-    'microsoft.app/managedenvironments' = 'cae-html2b-dev'
-    'microsoft.app/containerapps' = 'ca-html2b-dev'
-}
-if ($inventoryObjects.Count -ne $expectedInventory.Count) {
-    throw "Resource inventory contains $($inventoryObjects.Count) resources; expected $($expectedInventory.Count)."
-}
-
-foreach ($resource in $inventoryObjects) {
-    $resourceType = ([string] $resource.type).ToLowerInvariant()
-    if (-not $expectedInventory.ContainsKey($resourceType) -or
-        $expectedInventory[$resourceType] -ne [string] $resource.name) {
-        throw "Unexpected resource found: $($resource.type)/$($resource.name)."
-    }
-}
-[System.IO.File]::WriteAllText(
-    (Join-Path $outputDirectory 'resource-inventory.json'),
-    $inventory)
-
-$revisions = Invoke-AzureCli -Arguments @(
-    'rest', '--method', 'get',
-    '--uri', "$($state.id)/revisions?api-version=2026-01-01",
-    '--query', 'value[].{name:name,active:properties.active,healthState:properties.healthState,provisioningState:properties.provisioningState,createdTime:properties.createdTime}',
-    '--output', 'json'
-)
-$revisionObjects = @($revisions | ConvertFrom-Json)
-$latestRevision = @($revisionObjects | Where-Object {
-        $_.name -eq $state.properties.latestRevisionName
-    })
-if ($latestRevision.Count -ne 1 -or
-    $latestRevision[0].active -ne $true -or
-    $latestRevision[0].healthState -ne 'Healthy' -or
-    $latestRevision[0].provisioningState -notin @('Provisioned', 'Succeeded')) {
-    throw 'The latest revision is not active, healthy, and provisioned.'
-}
-[System.IO.File]::WriteAllText(
-    (Join-Path $outputDirectory 'revisions.json'),
-    $revisions)
-
-$replicas = @(Get-RevisionReplicas `
-        -ContainerAppResourceId $state.id `
-        -RevisionName $state.properties.latestRevisionName)
-if ($replicas.Count -gt 1) {
-    throw "Replica cap violated; Azure reported $($replicas.Count) replicas."
-}
-[System.IO.File]::WriteAllText(
-    (Join-Path $outputDirectory 'replicas.json'),
-    ($replicas | ConvertTo-Json -Depth 5 -AsArray))
-
-$registryId = Invoke-AzureCli -Arguments @(
-    'acr', 'show',
-    '--resource-group', $ResourceGroupName,
-    '--name', 'crhtml2bdev',
-    '--query', 'id',
-    '--output', 'tsv'
-)
-$roleAssignmentsJson = Invoke-AzureCli -Arguments @(
-    'role', 'assignment', 'list',
-    '--scope', $registryId,
-    '--query', '[].{principalId:principalId,roleDefinitionId:roleDefinitionId,scope:scope,condition:condition,conditionVersion:conditionVersion}',
-    '--output', 'json'
-)
-$roleAssignments = @($roleAssignmentsJson | ConvertFrom-Json | Where-Object {
-        $_.scope -ieq $registryId
-    })
-if ($roleAssignments.Count -ne 2) {
-    throw "Expected two direct ACR repository role assignments, found $($roleAssignments.Count)."
-}
-
-$operatorPrincipalId = Invoke-AzureCli -Arguments @(
-    'ad', 'signed-in-user', 'show',
-    '--query', 'id',
-    '--output', 'tsv'
-)
-$runtimePrincipalId = Invoke-AzureCli -Arguments @(
-    'identity', 'show',
-    '--resource-group', $ResourceGroupName,
-    '--name', 'id-html2b-api-dev',
-    '--query', 'principalId',
-    '--output', 'tsv'
-)
-$writerAssignment = @($roleAssignments | Where-Object {
-        $_.roleDefinitionId -like '*/2a1e307c-b015-4ebd-883e-5b7698a07328'
-    })
-$readerAssignment = @($roleAssignments | Where-Object {
-        $_.roleDefinitionId -like '*/b93aa761-3e63-49ed-ac28-beffa264f7ac'
-    })
-if ($writerAssignment.Count -ne 1 -or
-    $writerAssignment[0].principalId -ine $operatorPrincipalId -or
-    $writerAssignment[0].conditionVersion -ne '2.0' -or
-    $writerAssignment[0].condition -notlike "*StringEqualsIgnoreCase 'html2b-api'*" -or
-    $writerAssignment[0].condition -notlike "*content/write*" -or
-    $writerAssignment[0].condition -notlike "*metadata/write*") {
-    throw 'Operator ACR repository-writer assignment is missing or overbroad.'
-}
-
-if ($readerAssignment.Count -ne 1 -or
-    $readerAssignment[0].principalId -ine $runtimePrincipalId -or
-    $readerAssignment[0].conditionVersion -ne '2.0' -or
-    $readerAssignment[0].condition -notlike "*StringEqualsIgnoreCase 'html2b-api'*") {
-    throw 'Runtime ACR repository-reader assignment is missing or overbroad.'
-}
-
-[System.IO.File]::WriteAllText(
-    (Join-Path $outputDirectory 'repository-role-assignments.json'),
-    $roleAssignmentsJson)
-
-$scaleToZeroDuration = Wait-ContainerAppScaledToZero `
-    -ContainerAppResourceId $state.id `
-    -RevisionName $state.properties.latestRevisionName
-[System.IO.File]::WriteAllText(
-    (Join-Path $outputDirectory 'scale-to-zero.txt'),
-    "scaleToZeroSeconds=$([Math]::Round($scaleToZeroDuration.TotalSeconds, 1))")
-
-$coldWakeDuration = Wait-ContainerAppReady -ReadyUri "https://$fqdn/health/ready"
-Invoke-HttpValidation -BaseUri "https://$fqdn/" -OutputDirectory $outputDirectory
-$replicas = @(Get-RevisionReplicas `
-        -ContainerAppResourceId $state.id `
-        -RevisionName $state.properties.latestRevisionName)
-if ($replicas.Count -gt 1) {
-    throw "Replica cap violated after cold wake-up; Azure reported $($replicas.Count) replicas."
-}
-[System.IO.File]::WriteAllText(
-    (Join-Path $outputDirectory 'replicas.json'),
-    ($replicas | ConvertTo-Json -Depth 5 -AsArray))
-
-$workspaceCustomerId = Invoke-AzureCli -Arguments @(
-    'monitor', 'log-analytics', 'workspace', 'show',
-    '--resource-group', $ResourceGroupName,
-    '--workspace-name', 'log-html2b-dev',
-    '--query', 'customerId',
-    '--output', 'tsv'
-)
-$logQuery = "union isfuzzy=true ContainerAppConsoleLogs_CL, ContainerAppSystemLogs_CL | where ContainerAppName_s == '$ContainerAppName' | project TimeGenerated, RevisionName_s, ReplicaName_s, Log_s | order by TimeGenerated desc | take 100"
-$logs = Invoke-AzureCli -Arguments @(
-    'monitor', 'log-analytics', 'query',
-    '--workspace', $workspaceCustomerId,
-    '--analytics-query', $logQuery,
-    '--timespan', 'PT1H',
-    '--output', 'json'
-)
-[System.IO.File]::WriteAllText(
-    (Join-Path $outputDirectory 'sanitized-logs.json'),
-    $logs)
-
-Write-Host "FQDN: $fqdn"
-Write-Host "Active revision: $($state.properties.latestRevisionName)"
-Write-Host "Deployed image: $ExpectedContainerImage"
-Write-Host "Initial readiness: $([Math]::Round($initialReadinessDuration.TotalSeconds, 1)) seconds"
-Write-Host "Scale-to-zero: $([Math]::Round($scaleToZeroDuration.TotalSeconds, 1)) seconds"
-Write-Host "Cold-wake readiness: $([Math]::Round($coldWakeDuration.TotalSeconds, 1)) seconds"
-Write-Host "Replica count after validation: $($replicas.Count)"
-Write-Host 'Live Azure validation passed.'
+Write-Output "previewValidationEvidencePath=$evidencePath"
+Write-Output 'previewValidation=passed'

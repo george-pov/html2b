@@ -1,63 +1,60 @@
 param deploymentMode string
 param location string
 param containerRegistryName string
-param imageRepositoryName string
+param renderImageRepositoryName string
 param logAnalyticsWorkspaceName string
-param containerAppsEnvironmentName string
-param runtimeIdentityName string
-param containerAppName string
-param containerImage string
-param containerCpu int
-param containerMemory string
-param minReplicas int
-param maxReplicas int
-param httpConcurrency int
+param renderContainerAppsEnvironmentName string
+param renderRuntimeIdentityName string
+param renderContainerAppName string
+param containerAppsSubnetId string
+param renderImage string
+param renderCpu int
+param renderMemory string
+param renderMinReplicas int
+param renderMaxReplicas int
+param renderHttpConcurrency int
 param baseTags object
 
 var repositoryReaderRoleDefinitionResourceId = subscriptionResourceId(
   'Microsoft.Authorization/roleDefinitions',
   'b93aa761-3e63-49ed-ac28-beffa264f7ac'
 )
-var runtimeRepositoryReaderCondition = '((!(ActionMatches{\'Microsoft.ContainerRegistry/registries/repositories/content/read\'}) AND !(ActionMatches{\'Microsoft.ContainerRegistry/registries/repositories/metadata/read\'})) OR (@Request[Microsoft.ContainerRegistry/registries/repositories:name] StringEqualsIgnoreCase \'${imageRepositoryName}\'))'
+var renderRepositoryReaderCondition = '((!(ActionMatches{\'Microsoft.ContainerRegistry/registries/repositories/content/read\'}) AND !(ActionMatches{\'Microsoft.ContainerRegistry/registries/repositories/metadata/read\'})) OR (@Request[Microsoft.ContainerRegistry/registries/repositories:name] StringEqualsIgnoreCase \'${renderImageRepositoryName}\'))'
 
 resource containerRegistry 'Microsoft.ContainerRegistry/registries@2025-11-01' existing = {
   name: containerRegistryName
 }
 
-resource logAnalyticsWorkspace 'Microsoft.OperationalInsights/workspaces@2025-02-01' existing = {
+resource logAnalyticsWorkspace 'Microsoft.OperationalInsights/workspaces@2026-03-01' existing = {
   name: logAnalyticsWorkspaceName
 }
 
-resource runtimeIdentity 'Microsoft.ManagedIdentity/userAssignedIdentities@2024-11-30' = if (deploymentMode == 'foundation') {
-  name: runtimeIdentityName
+resource renderRuntimeIdentity 'Microsoft.ManagedIdentity/userAssignedIdentities@2024-11-30' = {
+  name: renderRuntimeIdentityName
   location: location
   tags: union(baseTags, {
-    Component: 'Api'
+    Component: 'Render'
   })
 }
 
-resource existingRuntimeIdentity 'Microsoft.ManagedIdentity/userAssignedIdentities@2024-11-30' existing = if (deploymentMode == 'application') {
-  name: runtimeIdentityName
-}
-
-resource runtimeRepositoryReaderRoleAssignment 'Microsoft.Authorization/roleAssignments@2022-04-01' = if (deploymentMode == 'foundation') {
-  name: guid(containerRegistry.id, runtimeIdentity.id, repositoryReaderRoleDefinitionResourceId, imageRepositoryName)
+resource renderRepositoryReaderRoleAssignment 'Microsoft.Authorization/roleAssignments@2022-04-01' = {
+  name: guid(containerRegistry.id, renderRuntimeIdentity.id, repositoryReaderRoleDefinitionResourceId, renderImageRepositoryName)
   scope: containerRegistry
   properties: {
-    principalId: runtimeIdentity.?properties.principalId ?? ''
+    principalId: renderRuntimeIdentity.properties.principalId
     principalType: 'ServicePrincipal'
     roleDefinitionId: repositoryReaderRoleDefinitionResourceId
-    condition: runtimeRepositoryReaderCondition
+    condition: renderRepositoryReaderCondition
     conditionVersion: '2.0'
-    description: 'Read Html2B images only from the html2b-api repository.'
+    description: 'Read Html2B images only from the html2b-render repository.'
   }
 }
 
-resource containerAppsEnvironment 'Microsoft.App/managedEnvironments@2026-01-01' = if (deploymentMode == 'foundation') {
-  name: containerAppsEnvironmentName
+resource renderContainerAppsEnvironment 'Microsoft.App/managedEnvironments@2026-01-01' = {
+  name: renderContainerAppsEnvironmentName
   location: location
   tags: union(baseTags, {
-    Component: 'Runtime'
+    Component: 'Render'
   })
   properties: {
     appLogsConfiguration: {
@@ -67,39 +64,47 @@ resource containerAppsEnvironment 'Microsoft.App/managedEnvironments@2026-01-01'
         sharedKey: logAnalyticsWorkspace.listKeys().primarySharedKey
       }
     }
+    vnetConfiguration: {
+      infrastructureSubnetId: containerAppsSubnetId
+      internal: true
+    }
+    workloadProfiles: [
+      {
+        name: 'Consumption'
+        workloadProfileType: 'Consumption'
+      }
+    ]
+    zoneRedundant: false
   }
 }
 
-resource existingContainerAppsEnvironment 'Microsoft.App/managedEnvironments@2026-01-01' existing = if (deploymentMode == 'application') {
-  name: containerAppsEnvironmentName
-}
-
-resource containerApp 'Microsoft.App/containerApps@2026-01-01' = if (deploymentMode == 'application') {
-  name: containerAppName
+resource renderContainerApp 'Microsoft.App/containerApps@2026-01-01' = if (deploymentMode == 'application') {
+  name: renderContainerAppName
   location: location
   tags: union(baseTags, {
-    Component: 'Api'
+    Component: 'Render'
   })
   identity: {
     type: 'UserAssigned'
     userAssignedIdentities: {
-      '${existingRuntimeIdentity.id}': {}
+      '${renderRuntimeIdentity.id}': {}
     }
   }
   properties: {
-    managedEnvironmentId: existingContainerAppsEnvironment.id
+    managedEnvironmentId: renderContainerAppsEnvironment.id
+    workloadProfileName: 'Consumption'
     configuration: {
       activeRevisionsMode: 'Single'
       maxInactiveRevisions: 100
       identitySettings: [
         {
-          identity: existingRuntimeIdentity.id
+          identity: renderRuntimeIdentity.id
           lifecycle: 'None'
         }
       ]
       ingress: {
         external: true
-        allowInsecure: false
+        allowInsecure: true
         targetPort: 8080
         transport: 'auto'
         exposedPort: 0
@@ -112,19 +117,19 @@ resource containerApp 'Microsoft.App/containerApps@2026-01-01' = if (deploymentM
       }
       registries: [
         {
-          server: '${containerRegistryName}.azurecr.io'
-          identity: existingRuntimeIdentity.id
+          server: containerRegistry.properties.loginServer
+          identity: renderRuntimeIdentity.id
         }
       ]
     }
     template: {
       containers: [
         {
-          name: 'html2b-api'
-          image: containerImage
+          name: 'html2b-render'
+          image: renderImage
           resources: {
-            cpu: containerCpu
-            memory: containerMemory
+            cpu: renderCpu
+            memory: renderMemory
           }
           probes: [
             {
@@ -170,8 +175,8 @@ resource containerApp 'Microsoft.App/containerApps@2026-01-01' = if (deploymentM
         }
       ]
       scale: {
-        minReplicas: minReplicas
-        maxReplicas: maxReplicas
+        minReplicas: renderMinReplicas
+        maxReplicas: renderMaxReplicas
         pollingInterval: 30
         cooldownPeriod: 300
         rules: [
@@ -179,7 +184,7 @@ resource containerApp 'Microsoft.App/containerApps@2026-01-01' = if (deploymentM
             name: 'http-one-render'
             http: {
               metadata: {
-                concurrentRequests: string(httpConcurrency)
+                concurrentRequests: string(renderHttpConcurrency)
               }
             }
           }
@@ -190,8 +195,7 @@ resource containerApp 'Microsoft.App/containerApps@2026-01-01' = if (deploymentM
   }
 }
 
-output runtimeIdentityName string = deploymentMode == 'foundation' ? runtimeIdentity.name : existingRuntimeIdentity.name
-output containerAppsEnvironmentName string = deploymentMode == 'foundation' ? containerAppsEnvironment.name : existingContainerAppsEnvironment.name
-output containerAppName string = containerApp.?name ?? ''
-output containerAppFqdn string = containerApp.?properties.configuration.ingress.fqdn ?? ''
-output deployedContainerImage string = deploymentMode == 'application' ? containerImage : ''
+output renderEnvironmentDefaultDomain string = renderContainerAppsEnvironment.properties.defaultDomain
+output renderEnvironmentStaticIp string = renderContainerAppsEnvironment.properties.staticIp
+output renderContainerAppFqdn string = renderContainerApp.?properties.configuration.ingress.fqdn ?? ''
+output deployedRenderImage string = deploymentMode == 'application' ? renderImage : ''

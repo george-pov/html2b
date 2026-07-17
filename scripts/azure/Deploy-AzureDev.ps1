@@ -1,10 +1,19 @@
-[CmdletBinding(SupportsShouldProcess, ConfirmImpact = 'High')]
+[CmdletBinding()]
 param(
     [Parameter(Mandatory)]
-    [ValidateSet('Validate', 'WhatIf', 'ApplyFoundation', 'Apply')]
+    [ValidateSet('Validate', 'WhatIf')]
     [string] $Operation,
 
-    [string] $ContainerImage = ''
+    [Parameter(Mandatory)]
+    [ValidatePattern('^[0-9a-f]{40}$')]
+    [string] $SourceCommit,
+
+    [string] $RenderImage = '',
+
+    [ValidatePattern('^[0-9a-fA-F-]{36}$')]
+    [string] $DeploymentPrincipalId = '',
+
+    [string] $OutputDirectory = 'build/deployment/004'
 )
 
 Set-StrictMode -Version Latest
@@ -31,7 +40,7 @@ function Invoke-AzureCli {
             return $null
         }
 
-        throw "Azure CLI failed with exit code $exitCode.`n$text"
+        throw "Azure CLI failed with exit code $exitCode. The command output was suppressed because it may contain deployment details."
     }
 
     return $text
@@ -53,248 +62,235 @@ function Assert-BicepCli {
 }
 
 function Get-AzureSubscriptionContext {
-    $accountJson = Invoke-AzureCli -Arguments @('account', 'show', '--output', 'json')
-    $account = $accountJson | ConvertFrom-Json
+    $account = Invoke-AzureCli -Arguments @(
+        'account', 'show',
+        '--query', '{name:name,id:id,tenantId:tenantId,state:state,userType:user.type,userName:user.name}',
+        '--output', 'json'
+    ) | ConvertFrom-Json
 
     if ($account.state -ne 'Enabled') {
-        throw "The selected Azure subscription is not enabled: $($account.name)."
+        throw "The selected Azure subscription '$($account.name)' is not enabled."
+    }
+
+    if ($account.userType -notin @('user', 'servicePrincipal')) {
+        throw "Unsupported Azure identity type '$($account.userType)'."
     }
 
     return [pscustomobject]@{
         Name = [string] $account.name
-        Id = [string] $account.id
-        TenantId = [string] $account.tenantId
+        Id = ([string] $account.id).ToLowerInvariant()
+        TenantId = ([string] $account.tenantId).ToLowerInvariant()
+        UserType = [string] $account.userType
+        UserName = [string] $account.userName
     }
 }
 
-function Get-DeploymentOperatorPrincipalId {
-    $principalId = Invoke-AzureCli -Arguments @(
-        'ad', 'signed-in-user', 'show',
-        '--query', 'id',
-        '--output', 'tsv'
-    )
-
-    if ($principalId -notmatch '^[0-9a-fA-F-]{36}$') {
-        throw 'Could not resolve the signed-in Azure user object ID.'
-    }
-
-    return $principalId.ToLowerInvariant()
-}
-
-function Get-ActiveContainerImage {
+function Resolve-DeploymentPrincipalId {
     param(
-        [string] $ResourceGroupName = 'rg-html2b-dev',
-        [string] $ContainerAppName = 'ca-html2b-dev'
+        [Parameter(Mandatory)]
+        [pscustomobject] $SubscriptionContext,
+
+        [string] $ExplicitPrincipalId
     )
 
-    $groupExists = Invoke-AzureCli -Arguments @(
-        'group', 'exists',
-        '--name', $ResourceGroupName,
-        '--output', 'tsv'
-    )
-
-    if ($groupExists -ne 'true') {
-        return $null
+    $resolvedPrincipalId = if ($SubscriptionContext.UserType -eq 'user') {
+        Invoke-AzureCli -Arguments @(
+            'ad', 'signed-in-user', 'show',
+            '--query', 'id',
+            '--output', 'tsv'
+        )
+    }
+    else {
+        $accessToken = Invoke-AzureCli -Arguments @(
+            'account', 'get-access-token',
+            '--resource', 'https://management.azure.com/',
+            '--query', 'accessToken',
+            '--output', 'tsv'
+        )
+        try {
+            $segments = $accessToken -split '\.'
+            if ($segments.Count -ne 3) {
+                throw 'Azure CLI returned an invalid access token shape.'
+            }
+            $payload = $segments[1].Replace('-', '+').Replace('_', '/')
+            switch ($payload.Length % 4) {
+                2 { $payload += '==' }
+                3 { $payload += '=' }
+            }
+            $claims = [System.Text.Encoding]::UTF8.GetString(
+                [Convert]::FromBase64String($payload)) | ConvertFrom-Json
+            [string] $claims.oid
+        }
+        finally {
+            $accessToken = $null
+        }
     }
 
-    $containerAppId = Invoke-AzureCli -AllowFailure -Arguments @(
-        'resource', 'show',
-        '--resource-group', $ResourceGroupName,
-        '--resource-type', 'Microsoft.App/containerApps',
-        '--name', $ContainerAppName,
-        '--api-version', '2026-01-01',
-        '--query', 'id',
-        '--output', 'tsv'
-    )
-
-    if ([string]::IsNullOrWhiteSpace($containerAppId)) {
-        return $null
+    if ($resolvedPrincipalId -notmatch '^[0-9a-fA-F-]{36}$') {
+        throw 'The active Azure principal object ID could not be resolved.'
     }
 
-    $image = Invoke-AzureCli -Arguments @(
-        'resource', 'show',
-        '--ids', $containerAppId,
-        '--api-version', '2026-01-01',
-        '--query', 'properties.template.containers[0].image',
-        '--output', 'tsv'
-    )
-
-    if ([string]::IsNullOrWhiteSpace($image)) {
-        throw 'The active Container App exists but its image could not be read.'
+    $resolvedPrincipalId = $resolvedPrincipalId.ToLowerInvariant()
+    if (-not [string]::IsNullOrWhiteSpace($ExplicitPrincipalId) -and
+        $resolvedPrincipalId -ne $ExplicitPrincipalId.ToLowerInvariant()) {
+        throw 'DeploymentPrincipalId does not match the active Azure identity.'
     }
 
-    return $image
+    return $resolvedPrincipalId
 }
 
-function Assert-ImmutableContainerImage {
+function Assert-ImmutableRenderImage {
     param(
         [Parameter(Mandatory)]
         [string] $Value
     )
 
-    $pattern = '^crhtml2bdev\.azurecr\.io/html2b-api@sha256:[0-9a-f]{64}$'
-    if ($Value -cnotmatch $pattern) {
-        throw 'Application deployment requires crhtml2bdev.azurecr.io/html2b-api@sha256:<64 lowercase hexadecimal characters>.'
+    if ($Value -cnotmatch '^crhtml2bdev\.azurecr\.io/html2b-render@sha256:[0-9a-f]{64}$') {
+        throw 'RenderImage must be the immutable crhtml2bdev.azurecr.io/html2b-render digest reference.'
     }
 }
 
-function Assert-FoundationTargetState {
+function Assert-SourceCommit {
     param(
-        [switch] $AllowContainerApp
+        [Parameter(Mandatory)]
+        [string] $RepositoryRoot,
+
+        [Parameter(Mandatory)]
+        [string] $ExpectedCommit
     )
 
-    $resourceGroupName = 'rg-html2b-dev'
-    $groupExists = Invoke-AzureCli -Arguments @(
-        'group', 'exists',
-        '--name', $resourceGroupName,
-        '--output', 'tsv'
-    )
-
-    if ($groupExists -ne 'true') {
-        return
+    $head = (& git -C $RepositoryRoot rev-parse HEAD 2>$null | Out-String).Trim()
+    if ($LASTEXITCODE -ne 0 -or $head -cne $ExpectedCommit) {
+        throw 'SourceCommit must equal the checked-out full HEAD commit.'
     }
 
-    $inventoryJson = Invoke-AzureCli -Arguments @(
-        'resource', 'list',
-        '--resource-group', $resourceGroupName,
-        '--query', '[].{id:id,name:name,type:type}',
-        '--output', 'json'
-    )
-    $inventory = @($inventoryJson | ConvertFrom-Json)
-    $approvedResources = @{
-        'microsoft.containerregistry/registries' = 'crhtml2bdev'
-        'microsoft.operationalinsights/workspaces' = 'log-html2b-dev'
-        'microsoft.managedidentity/userassignedidentities' = 'id-html2b-api-dev'
-        'microsoft.app/managedenvironments' = 'cae-html2b-dev'
-    }
-    if ($AllowContainerApp) {
-        $approvedResources['microsoft.app/containerapps'] = 'ca-html2b-dev'
-    }
-    $unexpected = [System.Collections.Generic.List[string]]::new()
-
-    foreach ($resource in $inventory) {
-        $type = ([string] $resource.type).ToLowerInvariant()
-        $name = [string] $resource.name
-
-        if ($type -eq 'microsoft.authorization/roleassignments' -and
-            ([string] $resource.id) -like '*/registries/crhtml2bdev/providers/Microsoft.Authorization/roleAssignments/*') {
-            continue
-        }
-
-        if (-not $approvedResources.ContainsKey($type) -or
-            $approvedResources[$type] -ne $name) {
-            $unexpected.Add("$($resource.type)/$name")
-        }
+    $trackedStatus = (& git -C $RepositoryRoot status --porcelain --untracked-files=all -- `
+        src/api/Html2b.slnx `
+        src/api/Html2b.AzureFunctions `
+        src/api/Html2b.Render `
+        bicep `
+        scripts/azure `
+        .github 2>$null | Out-String).Trim()
+    if ($LASTEXITCODE -ne 0) {
+        throw 'Could not inspect deployment source status.'
     }
 
-    if ($unexpected.Count -gt 0) {
-        throw "Foundation apply refused because rg-html2b-dev contains unexpected resources: $($unexpected -join ', ')."
+    if (-not [string]::IsNullOrWhiteSpace($trackedStatus)) {
+        throw 'Deployment and host inputs must be committed in SourceCommit.'
     }
 }
 
-function Assert-ApplicationTargetState {
-    Assert-FoundationTargetState -AllowContainerApp
+function Resolve-OutputDirectory {
+    param(
+        [Parameter(Mandatory)]
+        [string] $RepositoryRoot,
 
-    $resourceGroupName = 'rg-html2b-dev'
-    $groupExists = Invoke-AzureCli -Arguments @(
-        'group', 'exists',
-        '--name', $resourceGroupName,
-        '--output', 'tsv'
+        [Parameter(Mandatory)]
+        [string] $RequestedPath,
+
+        [Parameter(Mandatory)]
+        [string] $SourceCommit
     )
-    if ($groupExists -ne 'true') {
-        throw 'Application apply requires the approved image-ready foundation to exist first.'
+
+    $basePath = if ([System.IO.Path]::IsPathRooted($RequestedPath)) {
+        [System.IO.Path]::GetFullPath($RequestedPath)
+    }
+    else {
+        [System.IO.Path]::GetFullPath((Join-Path $RepositoryRoot $RequestedPath))
     }
 
-    $requiredFoundationResources = @(
-        @{ Type = 'Microsoft.ContainerRegistry/registries'; Name = 'crhtml2bdev' },
-        @{ Type = 'Microsoft.OperationalInsights/workspaces'; Name = 'log-html2b-dev' },
-        @{ Type = 'Microsoft.ManagedIdentity/userAssignedIdentities'; Name = 'id-html2b-api-dev' },
-        @{ Type = 'Microsoft.App/managedEnvironments'; Name = 'cae-html2b-dev' })
-    foreach ($resource in $requiredFoundationResources) {
-        $resourceId = Invoke-AzureCli -AllowFailure -Arguments @(
-            'resource', 'show',
-            '--resource-group', $resourceGroupName,
-            '--resource-type', $resource.Type,
-            '--name', $resource.Name,
-            '--query', 'id',
-            '--output', 'tsv'
-        )
-        if ([string]::IsNullOrWhiteSpace($resourceId)) {
-            throw "Application apply requires foundation resource $($resource.Type)/$($resource.Name)."
-        }
+    $buildRoot = [System.IO.Path]::GetFullPath((Join-Path $RepositoryRoot 'build'))
+    if (-not $basePath.StartsWith("$buildRoot$([System.IO.Path]::DirectorySeparatorChar)", [System.StringComparison]::OrdinalIgnoreCase)) {
+        throw 'OutputDirectory must remain beneath the repository build directory.'
     }
+
+    $resolvedPath = Join-Path $basePath $SourceCommit
+    $null = New-Item -ItemType Directory -Force -Path $resolvedPath
+    return $resolvedPath
 }
 
 function Invoke-BicepBuild {
     param(
         [Parameter(Mandatory)]
-        [string] $BicepFile,
+        [string] $RepositoryRoot,
 
         [Parameter(Mandatory)]
-        [string] $OutputFile
+        [string] $OutputDirectory
     )
 
+    $templatePath = Join-Path $RepositoryRoot 'bicep/main.bicep'
+    $compiledPath = Join-Path $OutputDirectory 'main.json'
     $null = Invoke-AzureCli -Arguments @(
         'bicep', 'build',
-        '--file', $BicepFile,
-        '--outfile', $OutputFile
+        '--file', $templatePath,
+        '--outfile', $compiledPath
     )
+
+    if (-not (Test-Path -LiteralPath $compiledPath -PathType Leaf)) {
+        throw 'Bicep compilation did not produce main.json.'
+    }
+
+    return $compiledPath
 }
 
 function Invoke-BicepParameterBuild {
     param(
         [Parameter(Mandatory)]
-        [string] $ParameterFile,
+        [string] $RepositoryRoot,
 
         [Parameter(Mandatory)]
-        [string] $OutputFile
+        [string] $OutputDirectory
     )
 
+    $parameterSourcePath = Join-Path $RepositoryRoot 'bicep/environments/dev.bicepparam'
+    $compiledPath = Join-Path $OutputDirectory 'dev.parameters.json'
     $null = Invoke-AzureCli -Arguments @(
         'bicep', 'build-params',
-        '--file', $ParameterFile,
-        '--outfile', $OutputFile
+        '--file', $parameterSourcePath,
+        '--outfile', $compiledPath
     )
+
+    if (-not (Test-Path -LiteralPath $compiledPath -PathType Leaf)) {
+        throw 'Bicep parameter compilation did not produce dev.parameters.json.'
+    }
+
+    return $compiledPath
 }
 
 function New-DeploymentArguments {
     param(
         [Parameter(Mandatory)]
-        [string] $Verb,
+        [ValidateSet('validate', 'what-if')]
+        [string] $AzureOperation,
+
+        [Parameter(Mandatory)]
+        [string] $RepositoryRoot,
 
         [Parameter(Mandatory)]
         [string] $DeploymentName,
 
         [Parameter(Mandatory)]
-        [string] $TemplateFile,
-
-        [Parameter(Mandatory)]
-        [string] $ParameterFile,
-
-        [Parameter(Mandatory)]
+        [ValidateSet('foundation', 'application')]
         [string] $DeploymentMode,
 
-        [Parameter(Mandatory)]
-        [string] $OperatorPrincipalId,
-
-        [string] $Image = ''
+        [string] $RenderImage
     )
 
-    $arguments = [System.Collections.Generic.List[string]]::new()
-    foreach ($argument in @(
-        'deployment', 'sub', $Verb,
+    $arguments = @(
+        'deployment', 'sub', $AzureOperation,
         '--name', $DeploymentName,
         '--location', 'westus2',
-        '--template-file', $TemplateFile,
-        '--parameters', $ParameterFile,
-        '--parameters', "deploymentMode=$DeploymentMode",
-        "deploymentOperatorPrincipalId=$OperatorPrincipalId",
-        "containerImage=$Image"
-    )) {
-        $arguments.Add($argument)
+        '--template-file', (Join-Path $RepositoryRoot 'bicep/main.bicep'),
+        '--parameters', (Join-Path $RepositoryRoot 'bicep/environments/dev.bicepparam'),
+        "deploymentMode=$DeploymentMode",
+        '--only-show-errors'
+    )
+
+    if ($DeploymentMode -eq 'application') {
+        $arguments += "renderImage=$RenderImage"
     }
 
-    return $arguments.ToArray()
+    return $arguments
 }
 
 function Invoke-SubscriptionValidation {
@@ -303,7 +299,7 @@ function Invoke-SubscriptionValidation {
         [string[]] $Arguments
     )
 
-    return Invoke-AzureCli -Arguments ($Arguments + @('--output', 'json'))
+    $null = Invoke-AzureCli -Arguments ($Arguments + @('--output', 'none'))
 }
 
 function Invoke-SubscriptionWhatIf {
@@ -319,167 +315,185 @@ function Invoke-SubscriptionWhatIf {
     ))
 }
 
-function Assert-WhatIfHasNoEffectiveChanges {
+function ConvertTo-SanitizedWhatIf {
     param(
         [Parameter(Mandatory)]
         [string] $WhatIfJson
     )
 
-    $result = $WhatIfJson | ConvertFrom-Json
-    if ($result.status -ne 'Succeeded') {
-        throw "Azure what-if status was '$($result.status)'."
+    $result = $WhatIfJson | ConvertFrom-Json -Depth 100
+    $changes = foreach ($change in @($result.changes)) {
+        $resourceId = [string] $change.resourceId
+        $segments = @($resourceId.Trim('/') -split '/')
+        $resourceGroupIndex = [Array]::IndexOf($segments, 'resourceGroups')
+        $providersIndex = [Array]::LastIndexOf($segments, 'providers')
+
+        $resourceGroup = if ($resourceGroupIndex -ge 0 -and $segments.Count -gt $resourceGroupIndex + 1) {
+            $segments[$resourceGroupIndex + 1]
+        }
+        else {
+            ''
+        }
+        $resourceType = if ($providersIndex -ge 0 -and $segments.Count -gt $providersIndex + 2) {
+            $typeSegments = [System.Collections.Generic.List[string]]::new()
+            $typeSegments.Add($segments[$providersIndex + 1])
+            for ($index = $providersIndex + 2; $index -lt $segments.Count; $index += 2) {
+                $typeSegments.Add($segments[$index])
+            }
+            $typeSegments -join '/'
+        }
+        elseif ($segments.Count -ge 2 -and $segments[0] -eq 'subscriptions' -and $resourceGroupIndex -ge 0) {
+            'Microsoft.Resources/resourceGroups'
+        }
+        else {
+            ''
+        }
+        $resourceName = if ($segments.Count -gt 0) { $segments[-1] } else { '' }
+
+        [ordered]@{
+            changeType = [string] $change.changeType
+            resourceGroup = $resourceGroup
+            resourceType = $resourceType
+            resourceName = $resourceName
+        }
     }
 
-    $effectiveChanges = @($result.changes | Where-Object {
-            $_.changeType -notin @('NoChange', 'Ignore')
-        })
-    if ($effectiveChanges.Count -ne 0) {
-        $summary = $effectiveChanges | ForEach-Object {
-            "$($_.changeType): $($_.resourceId)"
-        }
-        throw "Active-digest apply requires an empty what-if. Effective changes:`n$($summary -join "`n")"
+    return [ordered]@{
+        status = [string] $result.status
+        changes = @($changes | Sort-Object resourceGroup, resourceType, resourceName)
     }
 }
 
-function Invoke-SubscriptionDeployment {
+function Assert-SafeWhatIf {
     param(
         [Parameter(Mandatory)]
-        [string[]] $Arguments
+        [string] $WhatIfJson,
+
+        [Parameter(Mandatory)]
+        [System.Collections.IDictionary] $SanitizedWhatIf
     )
 
-    return Invoke-AzureCli -Arguments ($Arguments + @('--output', 'json'))
-}
+    $rawResult = $WhatIfJson | ConvertFrom-Json -Depth 100
+    $allowedChangeTypes = @('Create', 'Modify', 'NoChange', 'Deploy', 'Ignore')
+    $legacyNames = @('ca-html2b-dev', 'cae-html2b-dev', 'id-html2b-api-dev')
 
-$isApplyOperation = $Operation -in @('ApplyFoundation', 'Apply')
-if ($isApplyOperation -and
-    $PSBoundParameters.ContainsKey('Confirm') -and
-    -not [bool] $PSBoundParameters['Confirm']) {
-    throw 'Apply operations reject -Confirm:$false. Interactive confirmation is required.'
+    foreach ($change in @($rawResult.changes)) {
+        if ([string] $change.changeType -notin $allowedChangeTypes) {
+            throw "Unsafe Azure what-if change type '$($change.changeType)' was rejected."
+        }
+
+        if ($null -ne $change.before -and $null -ne $change.after) {
+            foreach ($identityProperty in @('id', 'name', 'type')) {
+                $beforeValue = [string] $change.before.$identityProperty
+                $afterValue = [string] $change.after.$identityProperty
+                if (-not [string]::IsNullOrWhiteSpace($beforeValue) -and
+                    -not [string]::IsNullOrWhiteSpace($afterValue) -and
+                    $beforeValue -cne $afterValue) {
+                    throw "Azure what-if proposed a resource replacement through '$identityProperty'."
+                }
+            }
+        }
+    }
+
+    foreach ($change in @($SanitizedWhatIf.changes)) {
+        if ($change.resourceType -eq 'Microsoft.Resources/resourceGroups') {
+            if ($change.resourceName -ne 'rg-html2b-dev') {
+                throw "Azure what-if targeted unexpected resource group '$($change.resourceName)'."
+            }
+        }
+        elseif ($change.resourceGroup -ne 'rg-html2b-dev') {
+            throw "Azure what-if targeted out-of-scope resource group '$($change.resourceGroup)'."
+        }
+
+        if ($change.changeType -notin @('NoChange', 'Ignore') -and
+            $change.resourceName -in $legacyNames) {
+            throw "Azure what-if proposed changing retained legacy resource '$($change.resourceName)'."
+        }
+    }
+
+    $serialized = $SanitizedWhatIf | ConvertTo-Json -Depth 10
+    if ($serialized -match '(?i)(password|secret|token|connectionstring|instrumentationkey|sharedkey|accountkey|sas)') {
+        throw 'Sanitized Azure what-if contains a secret-like field.'
+    }
 }
 
 Assert-AzureCli
 Assert-BicepCli
 
 $repositoryRoot = Resolve-RepositoryRoot
-$mainBicep = Join-Path $repositoryRoot 'bicep\main.bicep'
-$parameterFile = Join-Path $repositoryRoot 'bicep\environments\dev.bicepparam'
-$bicepOutputDirectory = Join-Path $repositoryRoot 'build\validation\002\p01\bicep'
-$null = [System.IO.Directory]::CreateDirectory($bicepOutputDirectory)
-$compiledTemplateFile = Join-Path $bicepOutputDirectory 'main.json'
-$compiledParameterFile = Join-Path $bicepOutputDirectory 'dev.parameters.json'
+Assert-SourceCommit -RepositoryRoot $repositoryRoot -ExpectedCommit $SourceCommit
+$subscriptionContext = Get-AzureSubscriptionContext
+$null = Resolve-DeploymentPrincipalId `
+    -SubscriptionContext $subscriptionContext `
+    -ExplicitPrincipalId $DeploymentPrincipalId
 
-$context = Get-AzureSubscriptionContext
-$operatorPrincipalId = Get-DeploymentOperatorPrincipalId
-$resolvedContainerImage = $ContainerImage.Trim()
-$deploymentMode = 'foundation'
-
-if ($Operation -eq 'ApplyFoundation') {
-    Assert-FoundationTargetState -AllowContainerApp
-    $resolvedContainerImage = ''
-}
-elseif ($Operation -eq 'Apply') {
-    Assert-ApplicationTargetState
-
-    if (-not [string]::IsNullOrWhiteSpace($resolvedContainerImage)) {
-        Assert-ImmutableContainerImage -Value $resolvedContainerImage
-        $deploymentMode = 'application'
-    }
-    else {
-        $activeImage = Get-ActiveContainerImage
-        if ([string]::IsNullOrWhiteSpace($activeImage)) {
-            throw 'Apply requires an immutable image digest, and no active Container App image could be discovered.'
-        }
-
-        Assert-ImmutableContainerImage -Value $activeImage
-        $resolvedContainerImage = $activeImage
-        $deploymentMode = 'application'
-    }
-}
-elseif (-not [string]::IsNullOrWhiteSpace($resolvedContainerImage)) {
-    Assert-ImmutableContainerImage -Value $resolvedContainerImage
-    $deploymentMode = 'application'
+$deploymentMode = if ([string]::IsNullOrWhiteSpace($RenderImage)) {
+    'foundation'
 }
 else {
-    $activeImage = Get-ActiveContainerImage
-    if (-not [string]::IsNullOrWhiteSpace($activeImage)) {
-        Assert-ImmutableContainerImage -Value $activeImage
-        $resolvedContainerImage = $activeImage
-        $deploymentMode = 'application'
-    }
+    Assert-ImmutableRenderImage -Value $RenderImage
+    'application'
 }
 
-Invoke-BicepBuild `
-    -BicepFile $mainBicep `
-    -OutputFile $compiledTemplateFile
-Invoke-BicepParameterBuild `
-    -ParameterFile $parameterFile `
-    -OutputFile $compiledParameterFile
+if ($Operation -eq 'WhatIf' -and $deploymentMode -ne 'application') {
+    throw 'WhatIf requires the immutable RenderImage so the complete topology is previewed.'
+}
 
-$deploymentName = 'html2b-dev-{0}-{1}' -f (
-    $Operation.ToLowerInvariant()),
-    (Get-Date).ToUniversalTime().ToString('yyyyMMddHHmmss')
+$resolvedOutputDirectory = Resolve-OutputDirectory `
+    -RepositoryRoot $repositoryRoot `
+    -RequestedPath $OutputDirectory `
+    -SourceCommit $SourceCommit
+$compiledTemplatePath = Invoke-BicepBuild `
+    -RepositoryRoot $repositoryRoot `
+    -OutputDirectory $resolvedOutputDirectory
+$compiledParametersPath = Invoke-BicepParameterBuild `
+    -RepositoryRoot $repositoryRoot `
+    -OutputDirectory $resolvedOutputDirectory
 
-Write-Host "Environment: dev"
-Write-Host "Location: westus2"
-Write-Host "Resource group: rg-html2b-dev"
-Write-Host "Subscription: $($context.Name) ($($context.Id))"
-Write-Host "Tenant: $($context.TenantId)"
-Write-Host "Operation: $Operation"
-Write-Host "Deployment mode: $deploymentMode"
-Write-Host "Deployment name: $deploymentName"
-Write-Host "Container image: $resolvedContainerImage"
-
+$deploymentName = "html2b-004-$($SourceCommit.Substring(0, 12))-$($Operation.ToLowerInvariant())"
 $validationArguments = New-DeploymentArguments `
-    -Verb 'validate' `
+    -AzureOperation validate `
+    -RepositoryRoot $repositoryRoot `
     -DeploymentName $deploymentName `
-    -TemplateFile $compiledTemplateFile `
-    -ParameterFile $compiledParameterFile `
     -DeploymentMode $deploymentMode `
-    -OperatorPrincipalId $operatorPrincipalId `
-    -Image $resolvedContainerImage
-$validationResult = Invoke-SubscriptionValidation -Arguments $validationArguments
+    -RenderImage $RenderImage
+Invoke-SubscriptionValidation -Arguments $validationArguments
 
-if ($Operation -eq 'Validate') {
-    Write-Output $validationResult
-    return
+$validationEvidence = [ordered]@{
+    operation = $Operation
+    sourceCommit = $SourceCommit
+    deploymentMode = $deploymentMode
+    subscription = $subscriptionContext.Name
+    location = 'westus2'
+    resourceGroup = 'rg-html2b-dev'
+    validated = $true
+    validatedAtUtc = [DateTimeOffset]::UtcNow.ToString('O')
 }
-
-$whatIfArguments = New-DeploymentArguments `
-    -Verb 'what-if' `
-    -DeploymentName $deploymentName `
-    -TemplateFile $compiledTemplateFile `
-    -ParameterFile $compiledParameterFile `
-    -DeploymentMode $deploymentMode `
-    -OperatorPrincipalId $operatorPrincipalId `
-    -Image $resolvedContainerImage
-$whatIfResult = Invoke-SubscriptionWhatIf -Arguments $whatIfArguments
-
-if ($Operation -eq 'Apply' -and [string]::IsNullOrWhiteSpace($ContainerImage)) {
-    Assert-WhatIfHasNoEffectiveChanges -WhatIfJson $whatIfResult
-}
+$validationPath = Join-Path $resolvedOutputDirectory 'validation.sanitized.json'
+[System.IO.File]::WriteAllText(
+    $validationPath,
+    ($validationEvidence | ConvertTo-Json -Depth 5),
+    [System.Text.UTF8Encoding]::new($false))
 
 if ($Operation -eq 'WhatIf') {
-    Write-Output $whatIfResult
-    return
-}
-
-Write-Output $whatIfResult
-$description = if ($Operation -eq 'ApplyFoundation') {
-    'Create or converge the Html2B image-ready dev foundation and its repository role assignments'
-}
-else {
-    "Create or converge the Html2B dev Container App using $resolvedContainerImage"
-}
-$target = "subscription '$($context.Name)' ($($context.Id)), resource group 'rg-html2b-dev'"
-
-if ($PSCmdlet.ShouldProcess($target, $description)) {
-    $deploymentArguments = New-DeploymentArguments `
-        -Verb 'create' `
+    $whatIfArguments = New-DeploymentArguments `
+        -AzureOperation 'what-if' `
+        -RepositoryRoot $repositoryRoot `
         -DeploymentName $deploymentName `
-        -TemplateFile $compiledTemplateFile `
-        -ParameterFile $compiledParameterFile `
         -DeploymentMode $deploymentMode `
-        -OperatorPrincipalId $operatorPrincipalId `
-        -Image $resolvedContainerImage
-    Write-Output (Invoke-SubscriptionDeployment -Arguments $deploymentArguments)
+        -RenderImage $RenderImage
+    $rawWhatIf = Invoke-SubscriptionWhatIf -Arguments $whatIfArguments
+    $sanitizedWhatIf = ConvertTo-SanitizedWhatIf -WhatIfJson $rawWhatIf
+    Assert-SafeWhatIf -WhatIfJson $rawWhatIf -SanitizedWhatIf $sanitizedWhatIf
+
+    $whatIfPath = Join-Path $resolvedOutputDirectory 'what-if.sanitized.json'
+    [System.IO.File]::WriteAllText(
+        $whatIfPath,
+        ($sanitizedWhatIf | ConvertTo-Json -Depth 10),
+        [System.Text.UTF8Encoding]::new($false))
+    Write-Output "sanitizedWhatIfPath=$whatIfPath"
 }
+
+Write-Output "compiledTemplatePath=$compiledTemplatePath"
+Write-Output "compiledParametersPath=$compiledParametersPath"
+Write-Output "validationEvidencePath=$validationPath"
