@@ -1,7 +1,7 @@
-[CmdletBinding()]
+[CmdletBinding(SupportsShouldProcess, ConfirmImpact = 'High')]
 param(
     [Parameter(Mandatory)]
-    [ValidateSet('Validate', 'WhatIf')]
+    [ValidateSet('Validate', 'WhatIf', 'ApplyFoundation', 'ApplyApplication')]
     [string] $Operation,
 
     [Parameter(Mandatory)]
@@ -12,6 +12,8 @@ param(
 
     [ValidatePattern('^[0-9a-fA-F-]{36}$')]
     [string] $DeploymentPrincipalId = '',
+
+    [string] $PreviewManifestPath = '',
 
     [string] $OutputDirectory = 'build/deployment/004'
 )
@@ -150,6 +152,22 @@ function Resolve-DeploymentPrincipalId {
     return $resolvedPrincipalId
 }
 
+function Get-InfrastructureDeploymentPrincipalId {
+    $principalId = Invoke-AzureCli -Arguments @(
+        'identity', 'show',
+        '--resource-group', 'rg-html2b-dev',
+        '--name', 'id-html2b-infrastructure-dev',
+        '--query', 'principalId',
+        '--output', 'tsv'
+    )
+
+    if ($principalId -notmatch '^[0-9a-fA-F-]{36}$') {
+        throw 'The infrastructure deployment identity principal ID could not be resolved.'
+    }
+
+    return $principalId.ToLowerInvariant()
+}
+
 function Assert-ImmutableRenderImage {
     param(
         [Parameter(Mandatory)]
@@ -158,6 +176,137 @@ function Assert-ImmutableRenderImage {
 
     if ($Value -cnotmatch '^crhtml2bdev\.azurecr\.io/html2b-render@sha256:[0-9a-f]{64}$') {
         throw 'RenderImage must be the immutable crhtml2bdev.azurecr.io/html2b-render digest reference.'
+    }
+}
+
+function Get-FileSha256 {
+    param(
+        [Parameter(Mandatory)]
+        [string] $Path
+    )
+
+    if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) {
+        throw "Hash input '$Path' does not exist."
+    }
+
+    return (Get-FileHash -Algorithm SHA256 -LiteralPath $Path).Hash.ToLowerInvariant()
+}
+
+function Read-PreviewManifest {
+    param(
+        [Parameter(Mandatory)]
+        [string] $Path,
+
+        [Parameter(Mandatory)]
+        [string] $SourceCommit,
+
+        [Parameter(Mandatory)]
+        [string] $CompiledTemplatePath,
+
+        [Parameter(Mandatory)]
+        [string] $CompiledParametersPath
+    )
+
+    if ([string]::IsNullOrWhiteSpace($Path) -or
+        -not (Test-Path -LiteralPath $Path -PathType Leaf)) {
+        throw 'A sanitized preview manifest is required before apply.'
+    }
+
+    $manifestTestPath = Join-Path $PSScriptRoot 'Test-AzureDevManifest.ps1'
+    $null = & $manifestTestPath `
+        -ManifestPath $Path `
+        -ExpectedSourceCommit $SourceCommit `
+        -ExpectedMode Preview `
+        -ExpectedBicepPath $CompiledTemplatePath `
+        -ExpectedParametersPath $CompiledParametersPath
+
+    $convertFromJsonParameters = @{
+        Depth = 30
+    }
+    if ((Get-Command ConvertFrom-Json).Parameters.ContainsKey('DateKind')) {
+        $convertFromJsonParameters.DateKind = 'String'
+    }
+    $manifest = Get-Content -Raw -LiteralPath $Path |
+        ConvertFrom-Json @convertFromJsonParameters
+
+    if ([string] $manifest.artifacts.renderImage -cne
+        "crhtml2bdev.azurecr.io/html2b-render@$([string] $manifest.artifacts.renderDigest)") {
+        throw 'Preview manifest Render image and digest do not match.'
+    }
+
+    $validationByName = @{}
+    foreach ($validation in @($manifest.validation)) {
+        $validationByName[[string] $validation.name] = [string] $validation.status
+    }
+    foreach ($requiredValidation in @(
+            'Repository',
+            'AzureValidation',
+            'AzureWhatIf',
+            'PreviewState'
+        )) {
+        if ($validationByName[$requiredValidation] -ne 'Passed') {
+            throw "Preview manifest validation '$requiredValidation' did not pass."
+        }
+    }
+
+    return $manifest
+}
+
+function Assert-FoundationApplyPreconditions {
+    param(
+        [Parameter(Mandatory)]
+        [pscustomobject] $Manifest,
+
+        [Parameter(Mandatory)]
+        [string] $SourceCommit,
+
+        [Parameter(Mandatory)]
+        [string] $ActivePrincipalId,
+
+        [Parameter(Mandatory)]
+        [string] $ExpectedPrincipalId,
+
+        [string] $RenderImage
+    )
+
+    if ([string] $Manifest.source.commit -cne $SourceCommit) {
+        throw 'Foundation apply source does not match the preview manifest.'
+    }
+    if (-not [string]::IsNullOrWhiteSpace($RenderImage)) {
+        throw 'ApplyFoundation does not accept RenderImage.'
+    }
+    if ($ActivePrincipalId -cne $ExpectedPrincipalId) {
+        throw 'ApplyFoundation requires the exact infrastructure deployment identity.'
+    }
+}
+
+function Assert-ApplicationApplyPreconditions {
+    param(
+        [Parameter(Mandatory)]
+        [pscustomobject] $Manifest,
+
+        [Parameter(Mandatory)]
+        [string] $SourceCommit,
+
+        [Parameter(Mandatory)]
+        [string] $ActivePrincipalId,
+
+        [Parameter(Mandatory)]
+        [string] $ExpectedPrincipalId,
+
+        [Parameter(Mandatory)]
+        [string] $RenderImage
+    )
+
+    Assert-ImmutableRenderImage -Value $RenderImage
+    if ([string] $Manifest.source.commit -cne $SourceCommit) {
+        throw 'Application apply source does not match the preview manifest.'
+    }
+    if ([string] $Manifest.artifacts.renderImage -cne $RenderImage) {
+        throw 'ApplyApplication RenderImage does not match the preview manifest.'
+    }
+    if ($ActivePrincipalId -cne $ExpectedPrincipalId) {
+        throw 'ApplyApplication requires the exact infrastructure deployment identity.'
     }
 }
 
@@ -271,7 +420,7 @@ function Invoke-BicepParameterBuild {
 function New-DeploymentArguments {
     param(
         [Parameter(Mandatory)]
-        [ValidateSet('validate', 'what-if')]
+        [ValidateSet('validate', 'what-if', 'create')]
         [string] $AzureOperation,
 
         [Parameter(Mandatory)]
@@ -324,6 +473,15 @@ function Invoke-SubscriptionWhatIf {
         '--no-pretty-print',
         '--output', 'json'
     ))
+}
+
+function Invoke-SubscriptionDeployment {
+    param(
+        [Parameter(Mandatory)]
+        [string[]] $Arguments
+    )
+
+    return Invoke-AzureCli -Arguments ($Arguments + @('--output', 'json'))
 }
 
 function ConvertTo-SanitizedWhatIf {
@@ -386,7 +544,12 @@ function Assert-SafeWhatIf {
 
     $rawResult = $WhatIfJson | ConvertFrom-Json -Depth 100
     $allowedChangeTypes = @('Create', 'Modify', 'NoChange', 'Deploy', 'Ignore')
-    $legacyNames = @('ca-html2b-dev', 'cae-html2b-dev', 'id-html2b-api-dev')
+    $retainedNames = @(
+        'ca-html2b-dev',
+        'cae-html2b-dev',
+        'id-html2b-api-dev',
+        'id-html2b-infrastructure-dev'
+    )
 
     foreach ($change in @($rawResult.changes)) {
         if ([string] $change.changeType -notin $allowedChangeTypes) {
@@ -417,8 +580,8 @@ function Assert-SafeWhatIf {
         }
 
         if ($change.changeType -notin @('NoChange', 'Ignore') -and
-            $change.resourceName -in $legacyNames) {
-            throw "Azure what-if proposed changing retained legacy resource '$($change.resourceName)'."
+            $change.resourceName -in $retainedNames) {
+            throw "Azure what-if proposed changing retained resource '$($change.resourceName)'."
         }
     }
 
@@ -428,17 +591,162 @@ function Assert-SafeWhatIf {
     }
 }
 
+function Assert-DeploymentMatchesWhatIf {
+    param(
+        [Parameter(Mandatory)]
+        [System.Collections.IDictionary] $SanitizedWhatIf,
+
+        [Parameter(Mandatory)]
+        [ValidateSet('foundation', 'application')]
+        [string] $DeploymentMode,
+
+        [Parameter(Mandatory)]
+        [pscustomobject] $Manifest,
+
+        [string] $RenderImage
+    )
+
+    if ($SanitizedWhatIf.status -ne 'Succeeded') {
+        throw "Fresh Azure what-if status '$($SanitizedWhatIf.status)' is not successful."
+    }
+
+    if ($DeploymentMode -eq 'foundation') {
+        if (-not [string]::IsNullOrWhiteSpace($RenderImage)) {
+            throw 'Foundation deployment input differs from its fresh what-if.'
+        }
+    }
+    elseif ([string] $Manifest.artifacts.renderImage -cne $RenderImage) {
+        throw 'Application deployment Render image differs from its fresh what-if.'
+    }
+
+    foreach ($change in @($SanitizedWhatIf.changes)) {
+        if ($change.changeType -in @('Delete', 'DeleteThenCreate', 'CreateThenDelete')) {
+            throw "Fresh Azure what-if contains forbidden '$($change.changeType)' change."
+        }
+    }
+}
+
+function ConvertTo-SanitizedDeployment {
+    param(
+        [Parameter(Mandatory)]
+        [string] $DeploymentJson,
+
+        [Parameter(Mandatory)]
+        [ValidateSet('foundation', 'application')]
+        [string] $DeploymentMode,
+
+        [Parameter(Mandatory)]
+        [string] $DeploymentName,
+
+        [Parameter(Mandatory)]
+        [string] $SourceCommit,
+
+        [Parameter(Mandatory)]
+        [AllowEmptyString()]
+        [string] $ExpectedRenderImage
+    )
+
+    $deployment = $DeploymentJson | ConvertFrom-Json -Depth 100
+    if ([string] $deployment.properties.provisioningState -ne 'Succeeded') {
+        throw 'Azure subscription deployment did not report successful provisioning.'
+    }
+
+    $outputs = $deployment.properties.outputs
+    $requiredOutputNames = @(
+        'resourceGroupName',
+        'containerRegistryLoginServer',
+        'renderContainerAppFqdn',
+        'functionAppName',
+        'functionAppDefaultHostName',
+        'applicationDeploymentClientId',
+        'deployedRenderImage'
+    )
+    foreach ($outputName in $requiredOutputNames) {
+        if ($null -eq $outputs.PSObject.Properties[$outputName]) {
+            throw "Azure subscription deployment omitted output '$outputName'."
+        }
+    }
+
+    $resourceGroupName = [string] $outputs.resourceGroupName.value
+    $containerRegistryLoginServer = [string] $outputs.containerRegistryLoginServer.value
+    $functionAppName = [string] $outputs.functionAppName.value
+    $applicationDeploymentClientId = [string] $outputs.applicationDeploymentClientId.value
+    $deployedRenderImage = [string] $outputs.deployedRenderImage.value
+
+    if ($resourceGroupName -ne 'rg-html2b-dev' -or
+        $containerRegistryLoginServer -ne 'crhtml2bdev.azurecr.io' -or
+        $functionAppName -ne 'func-html2b-api-dev' -or
+        $applicationDeploymentClientId -notmatch '^[0-9a-fA-F-]{36}$') {
+        throw 'Azure subscription deployment returned an unexpected topology output.'
+    }
+    if ($DeploymentMode -eq 'foundation' -and
+        -not [string]::IsNullOrWhiteSpace($deployedRenderImage)) {
+        throw 'Foundation deployment unexpectedly returned a Render image.'
+    }
+    if ($DeploymentMode -eq 'application' -and
+        $deployedRenderImage -cne $ExpectedRenderImage) {
+        throw 'Application deployment returned a different Render image.'
+    }
+
+    return [ordered]@{
+        provisioningState = 'Succeeded'
+        sourceCommit = $SourceCommit
+        deploymentName = $DeploymentName
+        deploymentMode = $DeploymentMode
+        resourceGroupName = $resourceGroupName
+        containerRegistryLoginServer = $containerRegistryLoginServer
+        renderContainerAppFqdn = [string] $outputs.renderContainerAppFqdn.value
+        functionAppName = $functionAppName
+        functionAppDefaultHostName = [string] $outputs.functionAppDefaultHostName.value
+        applicationDeploymentClientId = $applicationDeploymentClientId.ToLowerInvariant()
+        deployedRenderImage = $deployedRenderImage
+    }
+}
+
+function Write-SanitizedJson {
+    param(
+        [Parameter(Mandatory)]
+        [string] $Path,
+
+        [Parameter(Mandatory)]
+        [object] $Value,
+
+        [int] $Depth = 10
+    )
+
+    [System.IO.File]::WriteAllText(
+        $Path,
+        ($Value | ConvertTo-Json -Depth $Depth),
+        [System.Text.UTF8Encoding]::new($false))
+}
+
+if ($Operation -in @('ApplyFoundation', 'ApplyApplication') -and
+    $PSBoundParameters.ContainsKey('Confirm') -and
+    -not [bool] $PSBoundParameters['Confirm']) {
+    throw 'Apply operations reject confirmation suppression.'
+}
+
 Assert-AzureCli
 Assert-BicepCli
 
 $repositoryRoot = Resolve-RepositoryRoot
 Assert-SourceCommit -RepositoryRoot $repositoryRoot -ExpectedCommit $SourceCommit
 $subscriptionContext = Get-AzureSubscriptionContext
-$null = Resolve-DeploymentPrincipalId `
+$activePrincipalId = Resolve-DeploymentPrincipalId `
     -SubscriptionContext $subscriptionContext `
     -ExplicitPrincipalId $DeploymentPrincipalId
 
-$deploymentMode = if ([string]::IsNullOrWhiteSpace($RenderImage)) {
+$deploymentMode = if ($Operation -eq 'ApplyFoundation') {
+    if (-not [string]::IsNullOrWhiteSpace($RenderImage)) {
+        throw 'ApplyFoundation does not accept RenderImage.'
+    }
+    'foundation'
+}
+elseif ($Operation -eq 'ApplyApplication') {
+    Assert-ImmutableRenderImage -Value $RenderImage
+    'application'
+}
+elseif ([string]::IsNullOrWhiteSpace($RenderImage)) {
     'foundation'
 }
 else {
@@ -461,7 +769,15 @@ $compiledParametersPath = Invoke-BicepParameterBuild `
     -RepositoryRoot $repositoryRoot `
     -OutputDirectory $resolvedOutputDirectory
 
-$deploymentName = "html2b-004-$($SourceCommit.Substring(0, 12))-$($Operation.ToLowerInvariant())"
+$deploymentName = if ($Operation -eq 'ApplyFoundation') {
+    "html2b-004-$($SourceCommit.Substring(0, 12))-foundation"
+}
+elseif ($Operation -eq 'ApplyApplication') {
+    "html2b-004-$($SourceCommit.Substring(0, 12))-application"
+}
+else {
+    "html2b-004-$($SourceCommit.Substring(0, 12))-$($Operation.ToLowerInvariant())"
+}
 $validationArguments = New-DeploymentArguments `
     -AzureOperation validate `
     -RepositoryRoot $repositoryRoot `
@@ -475,18 +791,45 @@ $validationEvidence = [ordered]@{
     sourceCommit = $SourceCommit
     deploymentMode = $deploymentMode
     subscription = $subscriptionContext.Name
+    subscriptionId = $subscriptionContext.Id
+    tenantId = $subscriptionContext.TenantId
     location = 'westus2'
     resourceGroup = 'rg-html2b-dev'
     validated = $true
     validatedAtUtc = [DateTimeOffset]::UtcNow.ToString('O')
 }
 $validationPath = Join-Path $resolvedOutputDirectory 'validation.sanitized.json'
-[System.IO.File]::WriteAllText(
-    $validationPath,
-    ($validationEvidence | ConvertTo-Json -Depth 5),
-    [System.Text.UTF8Encoding]::new($false))
+Write-SanitizedJson -Path $validationPath -Value $validationEvidence -Depth 5
 
-if ($Operation -eq 'WhatIf') {
+$isApplyOperation = $Operation -in @('ApplyFoundation', 'ApplyApplication')
+$previewManifest = $null
+if ($isApplyOperation) {
+    $previewManifest = Read-PreviewManifest `
+        -Path $PreviewManifestPath `
+        -SourceCommit $SourceCommit `
+        -CompiledTemplatePath $compiledTemplatePath `
+        -CompiledParametersPath $compiledParametersPath
+    $expectedPrincipalId = Get-InfrastructureDeploymentPrincipalId
+
+    if ($Operation -eq 'ApplyFoundation') {
+        Assert-FoundationApplyPreconditions `
+            -Manifest $previewManifest `
+            -SourceCommit $SourceCommit `
+            -ActivePrincipalId $activePrincipalId `
+            -ExpectedPrincipalId $expectedPrincipalId `
+            -RenderImage $RenderImage
+    }
+    else {
+        Assert-ApplicationApplyPreconditions `
+            -Manifest $previewManifest `
+            -SourceCommit $SourceCommit `
+            -ActivePrincipalId $activePrincipalId `
+            -ExpectedPrincipalId $expectedPrincipalId `
+            -RenderImage $RenderImage
+    }
+}
+
+if ($Operation -eq 'WhatIf' -or $isApplyOperation) {
     $whatIfArguments = New-DeploymentArguments `
         -AzureOperation 'what-if' `
         -RepositoryRoot $repositoryRoot `
@@ -496,13 +839,56 @@ if ($Operation -eq 'WhatIf') {
     $rawWhatIf = Invoke-SubscriptionWhatIf -Arguments $whatIfArguments
     $sanitizedWhatIf = ConvertTo-SanitizedWhatIf -WhatIfJson $rawWhatIf
     Assert-SafeWhatIf -WhatIfJson $rawWhatIf -SanitizedWhatIf $sanitizedWhatIf
+    if ($isApplyOperation) {
+        Assert-DeploymentMatchesWhatIf `
+            -SanitizedWhatIf $sanitizedWhatIf `
+            -DeploymentMode $deploymentMode `
+            -Manifest $previewManifest `
+            -RenderImage $RenderImage
+    }
 
     $whatIfPath = Join-Path $resolvedOutputDirectory 'what-if.sanitized.json'
-    [System.IO.File]::WriteAllText(
-        $whatIfPath,
-        ($sanitizedWhatIf | ConvertTo-Json -Depth 10),
-        [System.Text.UTF8Encoding]::new($false))
+    Write-SanitizedJson -Path $whatIfPath -Value $sanitizedWhatIf -Depth 10
     Write-Output "sanitizedWhatIfPath=$whatIfPath"
+}
+
+if ($isApplyOperation) {
+    $renderDigest = [string] $previewManifest.artifacts.renderDigest
+    Write-Output "subscriptionName=$($subscriptionContext.Name)"
+    Write-Output "subscriptionId=$($subscriptionContext.Id)"
+    Write-Output "tenantId=$($subscriptionContext.TenantId)"
+    Write-Output 'resourceGroupName=rg-html2b-dev'
+    Write-Output "deploymentMode=$deploymentMode"
+    Write-Output "deploymentName=$deploymentName"
+    Write-Output "renderDigest=$renderDigest"
+
+    $target = "$($subscriptionContext.Id)/rg-html2b-dev/$deploymentName"
+    $action = "Apply $deploymentMode deployment for $SourceCommit with Render digest $renderDigest"
+    if ($PSCmdlet.ShouldProcess($target, $action)) {
+        $deploymentArguments = New-DeploymentArguments `
+            -AzureOperation create `
+            -RepositoryRoot $repositoryRoot `
+            -DeploymentName $deploymentName `
+            -DeploymentMode $deploymentMode `
+            -RenderImage $RenderImage
+        $deploymentJson = Invoke-SubscriptionDeployment -Arguments $deploymentArguments
+        $sanitizedDeployment = ConvertTo-SanitizedDeployment `
+            -DeploymentJson $deploymentJson `
+            -DeploymentMode $deploymentMode `
+            -DeploymentName $deploymentName `
+            -SourceCommit $SourceCommit `
+            -ExpectedRenderImage $RenderImage
+        $deploymentPath = Join-Path $resolvedOutputDirectory "$deploymentMode-deployment.sanitized.json"
+        Write-SanitizedJson -Path $deploymentPath -Value $sanitizedDeployment -Depth 10
+
+        Write-Output "deploymentEvidencePath=$deploymentPath"
+        Write-Output "containerRegistryLoginServer=$($sanitizedDeployment.containerRegistryLoginServer)"
+        Write-Output "renderContainerAppFqdn=$($sanitizedDeployment.renderContainerAppFqdn)"
+        Write-Output "functionAppName=$($sanitizedDeployment.functionAppName)"
+        Write-Output "functionDefaultHostName=$($sanitizedDeployment.functionAppDefaultHostName)"
+        Write-Output "applicationDeploymentClientId=$($sanitizedDeployment.applicationDeploymentClientId)"
+        Write-Output "deployedRenderImage=$($sanitizedDeployment.deployedRenderImage)"
+    }
 }
 
 Write-Output "compiledTemplatePath=$compiledTemplatePath"

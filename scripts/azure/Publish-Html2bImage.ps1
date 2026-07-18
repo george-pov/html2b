@@ -10,6 +10,15 @@ param(
     [ValidatePattern('^[0-9a-f]{40}$')]
     [string] $SourceCommit,
 
+    [switch] $Push,
+
+    [string] $PreviewManifestPath = '',
+
+    [ValidatePattern('^[0-9a-fA-F-]{36}$')]
+    [string] $ApplicationDeploymentClientId = '',
+
+    [string] $OrasPath = 'oras',
+
     [string] $OutputDirectory = 'build/deployment/004'
 )
 
@@ -50,6 +59,217 @@ function Invoke-DockerBuildx {
     )
 
     return Invoke-Docker -Arguments (@('buildx') + $Arguments)
+}
+
+function Invoke-AzureCli {
+    param(
+        [Parameter(Mandatory)]
+        [string[]] $Arguments
+    )
+
+    $output = & az @Arguments 2>&1
+    $exitCode = $LASTEXITCODE
+    if ($exitCode -ne 0) {
+        $commandLabel = (@($Arguments | Select-Object -First 3) -join ' ')
+        throw "Azure CLI command '$commandLabel' failed with exit code $exitCode. Output was suppressed."
+    }
+
+    return ($output | Out-String).Trim()
+}
+
+function Invoke-Oras {
+    param(
+        [Parameter(Mandatory)]
+        [string] $Executable,
+
+        [Parameter(Mandatory)]
+        [string[]] $Arguments,
+
+        [switch] $AllowNotFound
+    )
+
+    $output = & $Executable @Arguments 2>&1
+    $exitCode = $LASTEXITCODE
+    $text = ($output | Out-String).Trim()
+    if ($exitCode -ne 0) {
+        if ($AllowNotFound -and
+            $text -match '(?i)(manifest_unknown|name_unknown|not found|status code 404)') {
+            return $null
+        }
+
+        $commandLabel = (@($Arguments | Select-Object -First 2) -join ' ')
+        throw "ORAS command '$commandLabel' failed with exit code $exitCode. Output was suppressed."
+    }
+
+    return $text
+}
+
+function Assert-OrasVersion {
+    param(
+        [Parameter(Mandatory)]
+        [string] $Executable
+    )
+
+    if (-not (Get-Command $Executable -ErrorAction SilentlyContinue)) {
+        throw 'ORAS v1.3.3 is required for Render publication.'
+    }
+
+    $version = Invoke-Oras -Executable $Executable -Arguments @('version')
+    if ($version -notmatch '(?m)^Version:\s*1\.3\.3\s*$') {
+        throw 'Render publication requires exactly ORAS v1.3.3.'
+    }
+}
+
+function Assert-AcrLoginContext {
+    param(
+        [Parameter(Mandatory)]
+        [AllowEmptyString()]
+        [string] $ExpectedApplicationClientId
+    )
+
+    if (-not (Get-Command az -ErrorAction SilentlyContinue)) {
+        throw 'Azure CLI is required for Render publication.'
+    }
+    if ($ExpectedApplicationClientId -notmatch '^[0-9a-fA-F-]{36}$') {
+        throw 'ApplicationDeploymentClientId is required for Render publication.'
+    }
+
+    $account = Invoke-AzureCli -Arguments @(
+        'account', 'show',
+        '--query', '{state:state,userType:user.type,userName:user.name}',
+        '--output', 'json',
+        '--only-show-errors'
+    ) | ConvertFrom-Json
+    if ($account.state -ne 'Enabled' -or
+        $account.userType -ne 'servicePrincipal' -or
+        ([string] $account.userName).ToLowerInvariant() -ne
+        $ExpectedApplicationClientId.ToLowerInvariant()) {
+        throw 'Render publication requires the exact application deployment identity.'
+    }
+
+    $identity = Invoke-AzureCli -Arguments @(
+        'identity', 'show',
+        '--resource-group', 'rg-html2b-dev',
+        '--name', 'id-html2b-application-deploy-dev',
+        '--query', '{clientId:clientId,principalId:principalId}',
+        '--output', 'json',
+        '--only-show-errors'
+    ) | ConvertFrom-Json
+    if ([string] $identity.clientId -notmatch '^[0-9a-fA-F-]{36}$' -or
+        ([string] $identity.clientId).ToLowerInvariant() -ne
+        $ExpectedApplicationClientId.ToLowerInvariant() -or
+        [string] $identity.principalId -notmatch '^[0-9a-fA-F-]{36}$') {
+        throw 'ApplicationDeploymentClientId does not match the Bicep-owned identity.'
+    }
+
+    $registry = Invoke-AzureCli -Arguments @(
+        'acr', 'show',
+        '--name', 'crhtml2bdev',
+        '--query', '{name:name,loginServer:loginServer,adminUserEnabled:adminUserEnabled,roleAssignmentMode:roleAssignmentMode}',
+        '--output', 'json',
+        '--only-show-errors'
+    ) | ConvertFrom-Json
+    if ($registry.name -ne 'crhtml2bdev' -or
+        $registry.loginServer -ne 'crhtml2bdev.azurecr.io' -or
+        [bool] $registry.adminUserEnabled -or
+        $registry.roleAssignmentMode -ne 'AbacRepositoryPermissions') {
+        throw 'ACR login context does not match the exact secretless ABAC registry.'
+    }
+}
+
+function Get-ExistingCommitTagDigest {
+    param(
+        [Parameter(Mandatory)]
+        [string] $Executable,
+
+        [Parameter(Mandatory)]
+        [string] $CommitTag
+    )
+
+    $digest = Invoke-Oras `
+        -Executable $Executable `
+        -Arguments @('resolve', $CommitTag) `
+        -AllowNotFound
+    if ([string]::IsNullOrWhiteSpace($digest)) {
+        return ''
+    }
+    if ($digest -cnotmatch '^sha256:[0-9a-f]{64}$') {
+        throw 'Existing Render commit tag resolved to an invalid digest.'
+    }
+
+    return $digest
+}
+
+function Assert-CommitTagIsImmutable {
+    param(
+        [AllowEmptyString()]
+        [string] $ExistingDigest,
+
+        [Parameter(Mandatory)]
+        [string] $PreviewDigest
+    )
+
+    if ($PreviewDigest -cnotmatch '^sha256:[0-9a-f]{64}$') {
+        throw 'Preview Render digest is invalid.'
+    }
+    if ([string]::IsNullOrWhiteSpace($ExistingDigest)) {
+        return $false
+    }
+    if ($ExistingDigest -cne $PreviewDigest) {
+        throw 'The existing full-SHA Render tag points to a conflicting digest.'
+    }
+
+    return $true
+}
+
+function Push-RenderOciLayout {
+    param(
+        [Parameter(Mandatory)]
+        [string] $Executable,
+
+        [Parameter(Mandatory)]
+        [string] $OciLayoutPath,
+
+        [Parameter(Mandatory)]
+        [string] $SourceCommit,
+
+        [Parameter(Mandatory)]
+        [string] $CommitTag
+    )
+
+    if (-not (Test-Path -LiteralPath (Join-Path $OciLayoutPath 'index.json') -PathType Leaf)) {
+        throw 'The retained OCI layout is missing index.json.'
+    }
+
+    $null = Invoke-Oras -Executable $Executable -Arguments @(
+        'cp',
+        '--from-oci-layout',
+        "${OciLayoutPath}:$SourceCommit",
+        $CommitTag
+    )
+}
+
+function Resolve-PushedImageDigest {
+    param(
+        [Parameter(Mandatory)]
+        [string] $Executable,
+
+        [Parameter(Mandatory)]
+        [string] $CommitTag,
+
+        [Parameter(Mandatory)]
+        [string] $ExpectedDigest
+    )
+
+    $digest = Invoke-Oras -Executable $Executable -Arguments @('resolve', $CommitTag)
+    if ($digest -cnotmatch '^sha256:[0-9a-f]{64}$') {
+        throw 'Published Render commit tag resolved to an invalid digest.'
+    }
+    if ($digest -cne $ExpectedDigest) {
+        throw 'Published Render digest differs from the retained preview digest.'
+    }
+
+    return $digest
 }
 
 function Get-SourceCommit {
@@ -466,6 +686,7 @@ function Build-RenderOciLayout {
 
     $null = Invoke-DockerBuildx -Arguments (@(
         'build',
+        '--tag', $ImageReference,
         '--output', "type=oci,dest=$OciLayoutPath,tar=false"
     ) + $commonArguments)
 }
@@ -613,17 +834,103 @@ function New-RenderImageMetadata {
     }
 }
 
+function Read-RetainedRenderMetadata {
+    param(
+        [Parameter(Mandatory)]
+        [string] $MetadataPath,
+
+        [Parameter(Mandatory)]
+        [string] $OciLayoutPath,
+
+        [Parameter(Mandatory)]
+        [string] $SourceCommit,
+
+        [Parameter(Mandatory)]
+        [string] $CommitTag
+    )
+
+    if (-not (Test-Path -LiteralPath $MetadataPath -PathType Leaf)) {
+        throw 'Push requires retained Render metadata from the build step.'
+    }
+    if (-not (Test-Path -LiteralPath (Join-Path $OciLayoutPath 'index.json') -PathType Leaf)) {
+        throw 'Push requires the retained OCI layout from the build step.'
+    }
+
+    $metadata = Get-Content -Raw -LiteralPath $MetadataPath |
+        ConvertFrom-Json -Depth 20
+    if ($metadata.schema -ne 'Html2bRenderImageMetadataV1' -or
+        [string] $metadata.sourceCommit -cne $SourceCommit -or
+        [string] $metadata.commitTag -cne $CommitTag -or
+        [string] $metadata.platform -cne 'linux/amd64' -or
+        [bool] $metadata.provenanceAttestationIncluded -or
+        [bool] $metadata.sbomAttestationIncluded) {
+        throw 'Retained Render metadata does not match the selected build.'
+    }
+    if ([System.IO.Path]::GetFullPath([string] $metadata.ociLayoutPath) -cne
+        [System.IO.Path]::GetFullPath($OciLayoutPath)) {
+        throw 'Retained Render metadata points to a different OCI layout.'
+    }
+
+    $layoutDigest = Get-OciManifestDigest -OciLayoutPath $OciLayoutPath
+    $layoutIndex = Get-Content -Raw -LiteralPath (Join-Path $OciLayoutPath 'index.json') |
+        ConvertFrom-Json -Depth 20
+    if ([string] $layoutIndex.manifests[0].annotations.'org.opencontainers.image.ref.name' -cne
+        $SourceCommit) {
+        throw 'Retained OCI layout reference is not the selected full source SHA.'
+    }
+    if ([string] $metadata.manifestDigest -cne $layoutDigest -or
+        [string] $metadata.immutableImage -cne
+        "crhtml2bdev.azurecr.io/html2b-render@$layoutDigest") {
+        throw 'Retained Render metadata does not match the OCI layout bytes.'
+    }
+
+    return $metadata
+}
+
+function Read-RenderPreviewManifest {
+    param(
+        [Parameter(Mandatory)]
+        [AllowEmptyString()]
+        [string] $Path,
+
+        [Parameter(Mandatory)]
+        [string] $SourceCommit,
+
+        [Parameter(Mandatory)]
+        [pscustomobject] $Metadata
+    )
+
+    if ([string]::IsNullOrWhiteSpace($Path) -or
+        -not (Test-Path -LiteralPath $Path -PathType Leaf)) {
+        throw 'Push requires the sanitized preview manifest.'
+    }
+
+    $manifestTestPath = Join-Path $PSScriptRoot 'Test-AzureDevManifest.ps1'
+    $null = & $manifestTestPath `
+        -ManifestPath $Path `
+        -ExpectedSourceCommit $SourceCommit `
+        -ExpectedMode Preview
+    $manifest = Get-Content -Raw -LiteralPath $Path |
+        ConvertFrom-Json -Depth 30
+
+    if ([string] $manifest.artifacts.renderCommitTag -cne
+        [string] $Metadata.commitTag -or
+        [string] $manifest.artifacts.renderDigest -cne
+        [string] $Metadata.manifestDigest -or
+        [string] $manifest.artifacts.renderImage -cne
+        [string] $Metadata.immutableImage) {
+        throw 'Retained Render build does not match the sanitized preview manifest.'
+    }
+
+    return $manifest
+}
+
 if ($RegistryName -ne 'crhtml2bdev' -or $RepositoryName -ne 'html2b-render') {
     throw 'This feature is limited to crhtml2bdev.azurecr.io/html2b-render.'
-}
-if (-not (Get-Command docker -ErrorAction SilentlyContinue)) {
-    throw 'Docker is required.'
 }
 
 $repositoryRoot = Resolve-RepositoryRoot
 Assert-CleanRenderSource -RepositoryRoot $repositoryRoot -ExpectedCommit $SourceCommit
-$null = Invoke-Docker -Arguments @('info', '--format', '{{.ServerVersion}}')
-$null = Invoke-DockerBuildx -Arguments @('version')
 
 $renderOutputDirectory = Resolve-RenderOutputDirectory `
     -RepositoryRoot $repositoryRoot `
@@ -631,33 +938,85 @@ $renderOutputDirectory = Resolve-RenderOutputDirectory `
     -SourceCommit $SourceCommit
 $ociLayoutPath = Join-Path $renderOutputDirectory 'oci'
 $imageReference = "${RegistryName}.azurecr.io/${RepositoryName}:$SourceCommit"
-
-Build-RenderOciLayout `
-    -RepositoryRoot $repositoryRoot `
-    -ImageReference $imageReference `
-    -OciLayoutPath $ociLayoutPath
-Invoke-LocalRenderValidation -Image $imageReference -SourceCommit $SourceCommit
-
-$manifestDigest = Get-OciManifestDigest -OciLayoutPath $ociLayoutPath
-$imageIdentity = Assert-LocalAndOciImagesMatch `
-    -ImageReference $imageReference `
-    -OciLayoutPath $ociLayoutPath `
-    -ManifestDigest $manifestDigest
-$metadata = New-RenderImageMetadata `
-    -SourceCommit $SourceCommit `
-    -ImageReference $imageReference `
-    -ManifestDigest $manifestDigest `
-    -OciLayoutPath $ociLayoutPath `
-    -ConfigDigest $imageIdentity.ConfigDigest `
-    -LayerCount $imageIdentity.LayerCount
 $metadataPath = Join-Path $renderOutputDirectory 'render-image.json'
-[System.IO.File]::WriteAllText(
-    $metadataPath,
-    ($metadata | ConvertTo-Json -Depth 10),
-    [System.Text.UTF8Encoding]::new($false))
 
-Write-Output "renderImageTag=$imageReference"
-Write-Output "renderManifestDigest=$manifestDigest"
-Write-Output "renderImage=$($metadata.immutableImage)"
-Write-Output "renderOciLayoutPath=$ociLayoutPath"
-Write-Output "renderMetadataPath=$metadataPath"
+if ($Push) {
+    $metadata = Read-RetainedRenderMetadata `
+        -MetadataPath $metadataPath `
+        -OciLayoutPath $ociLayoutPath `
+        -SourceCommit $SourceCommit `
+        -CommitTag $imageReference
+    $previewManifest = Read-RenderPreviewManifest `
+        -Path $PreviewManifestPath `
+        -SourceCommit $SourceCommit `
+        -Metadata $metadata
+
+    Assert-OrasVersion -Executable $OrasPath
+    Assert-AcrLoginContext `
+        -ExpectedApplicationClientId $ApplicationDeploymentClientId
+    $null = Invoke-AzureCli -Arguments @(
+        'acr', 'login',
+        '--name', $RegistryName,
+        '--only-show-errors',
+        '--output', 'none'
+    )
+
+    $existingDigest = Get-ExistingCommitTagDigest `
+        -Executable $OrasPath `
+        -CommitTag $imageReference
+    $reused = Assert-CommitTagIsImmutable `
+        -ExistingDigest $existingDigest `
+        -PreviewDigest ([string] $previewManifest.artifacts.renderDigest)
+    if (-not $reused) {
+        Push-RenderOciLayout `
+            -Executable $OrasPath `
+            -OciLayoutPath $ociLayoutPath `
+            -SourceCommit $SourceCommit `
+            -CommitTag $imageReference
+    }
+
+    $publishedDigest = Resolve-PushedImageDigest `
+        -Executable $OrasPath `
+        -CommitTag $imageReference `
+        -ExpectedDigest ([string] $previewManifest.artifacts.renderDigest)
+    Write-Output "renderImage=${RegistryName}.azurecr.io/$RepositoryName@$publishedDigest"
+    Write-Output "renderImageTag=$imageReference"
+    Write-Output "renderManifestDigest=$publishedDigest"
+    Write-Output "renderPublication=$(if ($reused) { 'reused' } else { 'pushed' })"
+}
+else {
+    if (-not (Get-Command docker -ErrorAction SilentlyContinue)) {
+        throw 'Docker is required.'
+    }
+    $null = Invoke-Docker -Arguments @('info', '--format', '{{.ServerVersion}}')
+    $null = Invoke-DockerBuildx -Arguments @('version')
+
+    Build-RenderOciLayout `
+        -RepositoryRoot $repositoryRoot `
+        -ImageReference $imageReference `
+        -OciLayoutPath $ociLayoutPath
+    Invoke-LocalRenderValidation -Image $imageReference -SourceCommit $SourceCommit
+
+    $manifestDigest = Get-OciManifestDigest -OciLayoutPath $ociLayoutPath
+    $imageIdentity = Assert-LocalAndOciImagesMatch `
+        -ImageReference $imageReference `
+        -OciLayoutPath $ociLayoutPath `
+        -ManifestDigest $manifestDigest
+    $metadata = New-RenderImageMetadata `
+        -SourceCommit $SourceCommit `
+        -ImageReference $imageReference `
+        -ManifestDigest $manifestDigest `
+        -OciLayoutPath $ociLayoutPath `
+        -ConfigDigest $imageIdentity.ConfigDigest `
+        -LayerCount $imageIdentity.LayerCount
+    [System.IO.File]::WriteAllText(
+        $metadataPath,
+        ($metadata | ConvertTo-Json -Depth 10),
+        [System.Text.UTF8Encoding]::new($false))
+
+    Write-Output "renderImageTag=$imageReference"
+    Write-Output "renderManifestDigest=$manifestDigest"
+    Write-Output "renderImage=$($metadata.immutableImage)"
+    Write-Output "renderOciLayoutPath=$ociLayoutPath"
+    Write-Output "renderMetadataPath=$metadataPath"
+}
