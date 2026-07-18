@@ -149,12 +149,14 @@ jobs:
           )
           $trackedPattern = '(' + ($trackedPatternParts -join '|') + ')'
           $matches = @(git grep -n -I -E $trackedPattern -- ':!scripts/azure/Test-AzureDevManifest.ps1')
-          if ($LASTEXITCODE -notin @(0, 1)) {
+          $grepExitCode = $LASTEXITCODE
+          if ($grepExitCode -notin @(0, 1)) {
             throw 'Tracked-source secret scan failed to run.'
           }
           if ($matches.Count -gt 0) {
             throw 'Tracked-source secret scan found a forbidden value.'
           }
+          $global:LASTEXITCODE = 0
           $generatedPatternParts = @(
             ('AccountKey' + '='),
             ('SharedAccessSignature' + '='),
