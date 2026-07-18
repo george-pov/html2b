@@ -40,7 +40,18 @@ function Invoke-AzureCli {
             return $null
         }
 
-        throw "Azure CLI failed with exit code $exitCode. The command output was suppressed because it may contain deployment details."
+        $commandLabel = (@($Arguments | Select-Object -First 3) -join ' ')
+        $errorCode = if ($text -match '(?m)^(?:ERROR:\s*)?\((?<code>[A-Za-z][A-Za-z0-9_.-]+)\)') {
+            $Matches.code
+        }
+        elseif ($text -match '(?i)(unrecognized arguments|the following arguments are required|invalid choice)') {
+            'AzureCliArgumentError'
+        }
+        else {
+            'Unavailable'
+        }
+
+        throw "Azure CLI command '$commandLabel' failed with exit code $exitCode (error code: $errorCode). The command output was suppressed because it may contain deployment details."
     }
 
     return $text
@@ -282,14 +293,14 @@ function New-DeploymentArguments {
         '--location', 'westus2',
         '--template-file', (Join-Path $RepositoryRoot 'bicep/main.bicep'),
         '--parameters', (Join-Path $RepositoryRoot 'bicep/environments/dev.bicepparam'),
-        "deploymentMode=$DeploymentMode",
-        '--only-show-errors'
+        "deploymentMode=$DeploymentMode"
     )
 
     if ($DeploymentMode -eq 'application') {
         $arguments += "renderImage=$RenderImage"
     }
 
+    $arguments += '--only-show-errors'
     return $arguments
 }
 
