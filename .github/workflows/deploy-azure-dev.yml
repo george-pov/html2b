@@ -112,6 +112,7 @@ jobs:
     timeout-minutes: 45
     environment: dev
     permissions:
+      actions: read
       contents: read
       id-token: write
 
@@ -203,6 +204,8 @@ jobs:
           "AZURE_VALIDATION_PATH=$($values.validationEvidencePath)" >> $env:GITHUB_ENV
 
       - name: Validate preview state
+        env:
+          GH_TOKEN: ${{ github.token }}
         shell: pwsh
         run: |
           $values = @{}
