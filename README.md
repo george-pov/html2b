@@ -160,124 +160,1143 @@ page for every request.
 ## Azure dev deployment
 
 > [!WARNING]
-> The immutable Feature 002 image shown below remains live and can be retained
-> as a rollback target, but its single-container publication workflow does not
-> support the split Feature 003 source. Do not run
-> `scripts/azure/Publish-Html2bImage.ps1` from current `HEAD`, do not repoint it
-> to only one of the new hosts, and do not deploy a new Feature 003 image to
-> the existing single-container app. Feature 007 owns the replacement
-> deployment topology and publication workflow.
+> Both Feature 004 hosts are public, unauthenticated, and development-only.
+> Anyone who knows an endpoint can call it. Do not send secrets, personal data,
+> proprietary HTML, or untrusted content. This POC has no production SLA,
+> custom domain, authentication, private networking, backup, or multi-replica
+> availability. The public endpoints, retained ACR images, Function resources,
+> and Log Analytics ingestion can incur Azure charges.
 
-The repository includes Bicep and local PowerShell helpers for the manually
-operated development environment in `rg-html2b-dev` (`westus2`). The verified
-environment contains exactly:
+Feature 004 uses a manually operated, two-host deployment in
+`rg-html2b-dev` (`westus2`). `Html2b.AzureFunctions` is the public API host.
+`Html2b.Render` is a separate public HTTPS Container App. Bicep passes the
+generated Render HTTPS URL to the Function App as
+`RenderService__BaseUrl`. No GitHub deployment automation, VNet, subnet,
+private endpoint, or private DNS is part of this deployment.
 
-| Resource | Name |
+The endpoints verified on July 24, 2026 are:
+
+- Function API:
+  [`https://func-html2b-api-dev.azurewebsites.net`](https://func-html2b-api-dev.azurewebsites.net)
+- Render service:
+  [`https://ca-html2b-render-dev.ashyisland-b79aded0.westus2.azurecontainerapps.io`](https://ca-html2b-render-dev.ashyisland-b79aded0.westus2.azurecontainerapps.io)
+
+The current resource inventory is:
+
+| Ownership | Resource | Name |
+| --- | --- | --- |
+| Shared/reused | Resource group | `rg-html2b-dev` |
+| Shared/reused | Azure Container Registry | `crhtml2bdev` |
+| Shared/reused | Log Analytics workspace | `log-html2b-dev` |
+| Shared/reused | Container Apps environment | `cae-html2b-dev` |
+| Feature 004 | Function storage account | `sthtml2bfuncdev` |
+| Feature 004 | Private Function deployment container | `function-releases` |
+| Feature 004 | Flex Consumption plan | `plan-html2b-functions-dev` |
+| Feature 004 | Application Insights | `appi-html2b-dev` |
+| Feature 004 | Function App | `func-html2b-api-dev` |
+| Feature 004 | Render user-assigned identity | `id-html2b-render-dev` |
+| Feature 004 | Render Container App | `ca-html2b-render-dev` |
+| Retained legacy | Original runtime identity | `id-html2b-api-dev` |
+| Retained legacy | Original single-host Container App | `ca-html2b-dev` |
+| External legacy bootstrap state | Infrastructure identity | `id-html2b-infrastructure-dev` |
+
+Application Insights also created its platform-managed Failure Anomalies smart
+detector rule. The legacy `ca-html2b-dev` configuration was unchanged by the
+Feature 004 release. The manual Feature 004 procedure does not use
+`id-html2b-infrastructure-dev`.
+
+### Verified release
+
+The first complete two-host release is tied to one source commit and two
+recorded artifacts:
+
+| Item | Verified value |
 | --- | --- |
-| Azure Container Registry | `crhtml2bdev` |
-| Log Analytics workspace | `log-html2b-dev` |
-| Container Apps environment | `cae-html2b-dev` |
-| User-assigned runtime identity | `id-html2b-api-dev` |
-| Container App | `ca-html2b-dev` |
+| Source commit | `875aa3457020f3c7b96598052ce8ce52fe60faae` |
+| Render image | `crhtml2bdev.azurecr.io/html2b-render@sha256:5889be38d28e7ee0bf2e8bdd2ce8e461674e384abb83ead022ca45a8741c6f1d` |
+| Function ZIP SHA-256 | `96c75ba424759c3fe4d6831db7e0008a7546f69c56d6c41a049647c554d89dc8` |
 
-The generated endpoint is
-[`https://ca-html2b-dev.ashyisland-b79aded0.westus2.azurecontainerapps.io`](https://ca-html2b-dev.ashyisland-b79aded0.westus2.azurecontainerapps.io).
-It has external HTTPS ingress, no application authentication, one active
-revision, 1 vCPU, 2 GiB of memory, and scales from zero to at most one replica.
-The runtime identity can pull only from the `html2b-api` ACR repository. The
-local deployment operator can write only to that repository; ACR admin and
-anonymous access are disabled.
+The verified Function App is public, HTTPS-only, running .NET isolated `10.0`
+on Flex Consumption with 2,048 MB instance memory and a maximum of one
+instance. The Render app is public over HTTPS, rejects insecure serving, uses
+1 vCPU and 2 GiB memory, scales from zero to one replica, and permits one
+concurrent HTTP request per replica.
 
-### Prerequisites
+### Parameter sources
 
-The verified manual workflow uses PowerShell 7, Azure CLI with Bicep, Docker
-Desktop in Linux container mode, and the .NET 10 SDK. Sign in to Azure and
-select the intended subscription before running a deployment command:
+Do not commit subscription, tenant, or operator object IDs. Acquire them in
+the signed-in session. Fixed dev values come from
+`bicep/environments/dev.bicepparam`; source-specific values come from the clean
+Git commit being released.
 
-```powershell
-az account show --query '{name:name,id:id,tenantId:tenantId,state:state}'
-```
+| Parameter or variable | Value | Source |
+| --- | --- | --- |
+| `$subscriptionId` | Selected at deployment time | Copy from `az account list` |
+| `$deploymentOperatorPrincipalId` | Signed-in operator object ID | `az ad signed-in-user show --query id` |
+| `$environmentName` | `dev` | `dev.bicepparam` |
+| `$location` | `westus2` | `dev.bicepparam` |
+| `$resourceGroupName` | `rg-html2b-dev` | `dev.bicepparam` |
+| `$containerRegistryName` | `crhtml2bdev` | `dev.bicepparam` |
+| `$imageRepositoryName` | `html2b-render` | `dev.bicepparam` |
+| `$logAnalyticsWorkspaceName` | `log-html2b-dev` | `dev.bicepparam` |
+| `$containerAppsEnvironmentName` | `cae-html2b-dev` | `dev.bicepparam` |
+| `$functionStorageAccountName` | `sthtml2bfuncdev` | `dev.bicepparam` |
+| `$functionPlanName` | `plan-html2b-functions-dev` | `dev.bicepparam` |
+| `$applicationInsightsName` | `appi-html2b-dev` | `dev.bicepparam` |
+| `$functionAppName` | `func-html2b-api-dev` | `dev.bicepparam` |
+| `$functionDeploymentContainerName` | `function-releases` | `dev.bicepparam` |
+| `$functionRuntime` | `dotnet-isolated` | `dev.bicepparam` |
+| `$functionRuntimeVersion` | `10.0` | `dev.bicepparam` |
+| `$functionInstanceMemoryMb` | `2048` | `dev.bicepparam` |
+| `$functionMaximumInstanceCount` | `1` | `dev.bicepparam` |
+| `$renderIdentityName` | `id-html2b-render-dev` | `dev.bicepparam` |
+| `$renderContainerAppName` | `ca-html2b-render-dev` | `dev.bicepparam` |
+| `$renderCpu` | `1` | `dev.bicepparam` |
+| `$renderMemory` | `2Gi` | `dev.bicepparam` |
+| `$renderMinReplicas` | `0` | `dev.bicepparam` |
+| `$renderMaxReplicas` | `1` | `dev.bicepparam` |
+| `$renderHttpConcurrency` | `1` | `dev.bicepparam` |
+| `$sourceSha` | Full Git SHA | `git rev-parse HEAD` |
+| `$containerImageTag` | ACR repository plus full Git SHA | Derived before the build |
+| `$containerImage` | ACR repository plus manifest digest | Resolved after the build |
+| `$deploymentName` | `html2b-dev-` plus the first 12 SHA characters | Derived before deployment |
+| Function and Render host names | Generated by Azure | Bicep outputs and Azure readback |
 
-The operator needs permission to create the planned resources and role
-assignments. The scripts are deliberately limited to the exact dev resource
-names above. They do not create GitHub/OIDC deployment identities, registry
-passwords, or remote automation.
+### Prerequisites and local compilation
 
-### Deploy manually
+Use PowerShell 7, Git, `tar`, Azure CLI with Bicep, and the .NET 10 SDK.
+The operator must be able to deploy subscription-scope Bicep, create the
+planned resources and role assignments, and run ACR Tasks. The bootstrap
+template grants repository-scoped image data access; it does not grant the
+control-plane permission required to start `az acr build`.
 
-For a first deployment, validate and preview the image-ready foundation:
-
-```powershell
-./scripts/azure/Deploy-AzureDev.ps1 -Operation Validate
-./scripts/azure/Deploy-AzureDev.ps1 -Operation WhatIf
-```
-
-Inspect the exact subscription, resource group, names, tags, and repository
-role conditions. After separate approval for the live foundation mutation, run:
-
-```powershell
-./scripts/azure/Deploy-AzureDev.ps1 -Operation ApplyFoundation -Confirm
-```
-
-Application mode references the existing foundation and cannot silently
-converge ACR, logging, identity, or the Container Apps environment. A later
-foundation change must use its own preview, explicit approval, and
-`ApplyFoundation` operation. Current `HEAD` has no approved image publication
-or application-apply path for this Feature 002 topology.
-
-### Validate the live service
-
-Run the live validator with the deployed immutable digest:
-
-```powershell
-$containerImage = 'crhtml2bdev.azurecr.io/html2b-api@sha256:c12f592d54c04011c7c83db9a22d811107877fbac69777cd3cb881dff505eeb9'
-./scripts/azure/Test-AzureDev.ps1 -ExpectedContainerImage $containerImage
-```
-
-The validator checks the exact resource inventory, repository roles, runtime
-pull identity, revision health, HTTPS redirect, probes, CPU/memory, replica cap,
-PNG/JPEG/PDF headers and bytes, raster dimensions, PDF page size, and sanitized
-logs. It then waits for zero replicas, wakes the service through readiness, and
-repeats the render checks. The first verified run scaled to zero in 466.7
-seconds and became Chromium-ready 26 seconds after the cold request. Evidence
-is written beneath `build/validation/002/p01/live/` and is not committed.
-
-The current verified image is:
-
-```text
-crhtml2bdev.azurecr.io/html2b-api@sha256:c12f592d54c04011c7c83db9a22d811107877fbac69777cd3cb881dff505eeb9
-```
-
-### Deploy a new image
-
-Do not deploy a new image from current `HEAD` to the Feature 002 Container App.
-Wait for Feature 007 to define and validate both deployable hosts, their
-network boundary, and the replacement publication workflow. Existing ACR
-artifacts remain retained and may incur charges; do not retag a digest or use
-`latest` as an update or rollback mechanism.
-
-### Roll back an image
-
-Rollback is another reviewed immutable deployment, not a traffic edit or tag
-mutation. Preview the previously recorded digest, obtain live-apply approval,
-apply it as a new revision, and rerun full validation:
+The scripts under `scripts/azure/` still target the retired Feature 002
+single-host deployment. Do not use them for Feature 004. Run the commands below
+from the repository root.
 
 ```powershell
-$previousImage = 'crhtml2bdev.azurecr.io/html2b-api@sha256:c12f592d54c04011c7c83db9a22d811107877fbac69777cd3cb881dff505eeb9'
-./scripts/azure/Deploy-AzureDev.ps1 -Operation WhatIf -ContainerImage $previousImage
-./scripts/azure/Deploy-AzureDev.ps1 -Operation Apply -ContainerImage $previousImage -Confirm
-./scripts/azure/Test-AzureDev.ps1 -ExpectedContainerImage $previousImage
+Set-Location C:\Projects\html2b
+
+dotnet restore src/api/Html2b.slnx
+dotnet build src/api/Html2b.slnx --configuration Release --no-restore
+
+New-Item -ItemType Directory -Path build/validation/004/bicep -Force |
+  Out-Null
+
+az bicep build `
+  --file bicep/main.bicep `
+  --outfile build/validation/004/bicep/main.json
+
+az bicep build `
+  --file bicep/bootstrap.bicep `
+  --outfile build/validation/004/bicep/bootstrap.json
+
+az bicep build-params `
+  --file bicep/environments/dev.bicepparam `
+  --outfile build/validation/004/bicep/dev.parameters.json
 ```
 
-The first deployment has no earlier live digest to restore. A usable rollback
-point exists only after a later image update has recorded the current digest.
-Do not delete failed revisions or images as part of rollback.
+Stop if the .NET build or any Bicep command fails.
 
-This environment remains manual and development-only. It has no custom domain,
-authentication, persistence, backup, production SLA, multi-replica
-availability, or untrusted-content sandbox. Fixed trusted HTML is the only
-supported render input. The public endpoint, retained ACR artifacts, and Log
-Analytics ingestion can incur Azure charges even though the app scales to zero.
+### T006: Select the subscription and load parameters
+
+Sign in, list subscriptions, and paste the intended subscription ID into the
+placeholder. Never paste a real subscription or operator ID into this file.
+
+```powershell
+Set-Location C:\Projects\html2b
+
+az login
+
+az account list `
+  --query "[].{Name:name,SubscriptionId:id,State:state}" `
+  --output table
+
+$subscriptionId = '<paste SubscriptionId from az account list>'
+
+az account set --subscription $subscriptionId
+
+az account show `
+  --subscription $subscriptionId `
+  --query "{Name:name,SubscriptionId:id,TenantId:tenantId,State:state}" `
+  --output table
+
+$deploymentOperatorPrincipalId = (
+  az ad signed-in-user show --query id --output tsv
+).Trim()
+
+if ($deploymentOperatorPrincipalId -notmatch
+    '^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$') {
+    throw 'Could not read the signed-in deployment operator object ID.'
+}
+```
+
+Confirm the selected subscription is correct and its state is `Enabled`, then
+load the compiled parameters and source-specific values:
+
+```powershell
+$deploymentParameters = Get-Content `
+  build/validation/004/bicep/dev.parameters.json `
+  -Raw | ConvertFrom-Json
+
+$environmentName =
+  $deploymentParameters.parameters.environmentName.value
+$location = $deploymentParameters.parameters.location.value
+$resourceGroupName =
+  $deploymentParameters.parameters.resourceGroupName.value
+$containerRegistryName =
+  $deploymentParameters.parameters.containerRegistryName.value
+$imageRepositoryName =
+  $deploymentParameters.parameters.imageRepositoryName.value
+$logAnalyticsWorkspaceName =
+  $deploymentParameters.parameters.logAnalyticsWorkspaceName.value
+$containerAppsEnvironmentName =
+  $deploymentParameters.parameters.containerAppsEnvironmentName.value
+$functionStorageAccountName =
+  $deploymentParameters.parameters.functionStorageAccountName.value
+$functionPlanName =
+  $deploymentParameters.parameters.functionPlanName.value
+$applicationInsightsName =
+  $deploymentParameters.parameters.applicationInsightsName.value
+$functionAppName =
+  $deploymentParameters.parameters.functionAppName.value
+$functionDeploymentContainerName =
+  $deploymentParameters.parameters.functionDeploymentContainerName.value
+$functionRuntime =
+  $deploymentParameters.parameters.functionRuntime.value
+$functionRuntimeVersion =
+  $deploymentParameters.parameters.functionRuntimeVersion.value
+$functionInstanceMemoryMb =
+  $deploymentParameters.parameters.functionInstanceMemoryMb.value
+$functionMaximumInstanceCount =
+  $deploymentParameters.parameters.functionMaximumInstanceCount.value
+$renderIdentityName =
+  $deploymentParameters.parameters.renderIdentityName.value
+$renderContainerAppName =
+  $deploymentParameters.parameters.renderContainerAppName.value
+$renderCpu = $deploymentParameters.parameters.renderCpu.value
+$renderMemory = $deploymentParameters.parameters.renderMemory.value
+$renderMinReplicas =
+  $deploymentParameters.parameters.renderMinReplicas.value
+$renderMaxReplicas =
+  $deploymentParameters.parameters.renderMaxReplicas.value
+$renderHttpConcurrency =
+  $deploymentParameters.parameters.renderHttpConcurrency.value
+
+$workingTreeChanges = @(git status --porcelain)
+if ($workingTreeChanges.Count -ne 0) {
+    throw 'The Git working tree must be clean before deployment.'
+}
+
+git diff --check
+if ($LASTEXITCODE -ne 0) {
+    throw 'git diff --check failed.'
+}
+
+$sourceSha = (git rev-parse HEAD).Trim()
+if ($sourceSha -notmatch '^[0-9a-f]{40}$') {
+    throw 'Could not read a full Git commit SHA.'
+}
+
+$containerImageTag =
+  "${containerRegistryName}.azurecr.io/${imageRepositoryName}:$sourceSha"
+$deploymentName = "html2b-dev-$($sourceSha.Substring(0, 12))"
+$functionPublishDirectory = "build/publish/functions-$sourceSha"
+$functionZip = "build/publish/html2b-functions-$sourceSha.zip"
+$releaseManifestPath =
+  "build/validation/004/live/release-$sourceSha.json"
+
+New-Item -ItemType Directory -Path build/validation/004/live -Force |
+  Out-Null
+
+[pscustomobject]@{
+    SubscriptionId = $subscriptionId
+    DeploymentOperatorPrincipalId = $deploymentOperatorPrincipalId
+    SourceSha = $sourceSha
+    DeploymentName = $deploymentName
+    ContainerImageTag = $containerImageTag
+    FunctionZip = $functionZip
+} | Format-List
+```
+
+### T007: Verify the shared Azure resources
+
+Every Azure resource command must explicitly target `$subscriptionId`.
+
+```powershell
+az group show `
+  --subscription $subscriptionId `
+  --name $resourceGroupName `
+  --query "{Name:name,Location:location,State:properties.provisioningState}" `
+  --output table
+
+az acr show `
+  --subscription $subscriptionId `
+  --resource-group $resourceGroupName `
+  --name $containerRegistryName `
+  --query "{Name:name,LoginServer:loginServer,RoleAssignmentMode:roleAssignmentMode,State:provisioningState}" `
+  --output table
+
+az monitor log-analytics workspace show `
+  --subscription $subscriptionId `
+  --resource-group $resourceGroupName `
+  --workspace-name $logAnalyticsWorkspaceName `
+  --query "{Name:name,Location:location,State:provisioningState}" `
+  --output table
+
+az containerapp env show `
+  --subscription $subscriptionId `
+  --resource-group $resourceGroupName `
+  --name $containerAppsEnvironmentName `
+  --query "{Name:name,Location:location,State:properties.provisioningState}" `
+  --output table
+```
+
+The resource group, ACR, Log Analytics workspace, and Container Apps
+environment must exist in `westus2` with `Succeeded` state. ACR
+`RoleAssignmentMode` must be `AbacRepositoryPermissions`.
+
+For an initial deployment, the Function storage name must be globally
+available. For a repeat deployment of this environment, it must already exist
+in the expected resource group:
+
+```powershell
+$functionStorage = az storage account show `
+  --subscription $subscriptionId `
+  --resource-group $resourceGroupName `
+  --name $functionStorageAccountName `
+  --query "{Name:name,Location:location,State:provisioningState}" `
+  --output json 2>$null
+
+if ($LASTEXITCODE -eq 0) {
+    $functionStorage | ConvertFrom-Json | Format-List
+}
+else {
+    az storage account check-name `
+      --subscription $subscriptionId `
+      --name $functionStorageAccountName `
+      --query "{Available:nameAvailable,Reason:reason,Message:message}" `
+      --output yaml
+}
+```
+
+Before applying, record the retained legacy app configuration so it can be
+compared after deployment:
+
+```powershell
+$legacyAppBeforePath =
+  'build/validation/004/live/legacy-app-before.json'
+
+az containerapp show `
+  --subscription $subscriptionId `
+  --resource-group $resourceGroupName `
+  --name ca-html2b-dev `
+  --query "{Name:name,Location:location,State:properties.provisioningState,Identity:identity,Ingress:properties.configuration.ingress,Template:properties.template,Tags:tags,LatestRevision:properties.latestRevisionName,LatestReadyRevision:properties.latestReadyRevisionName}" `
+  --output json `
+  --no-pretty-print |
+  Set-Content -LiteralPath $legacyAppBeforePath -Encoding utf8
+
+$legacyAppBeforeHash = (
+  Get-FileHash -LiteralPath $legacyAppBeforePath -Algorithm SHA256
+).Hash.ToLowerInvariant()
+```
+
+Stop if any shared resource is missing or unhealthy, the ACR is not in ABAC
+repository-permissions mode, an initial storage name is unavailable, or the
+existing storage account is not the expected Feature 004 resource.
+
+### T008: Bootstrap ACR access and build Render
+
+Validate and preview the repository-scoped Writer assignment. All JSON
+What-If output uses `--no-pretty-print` so the saved evidence remains valid
+JSON without ANSI formatting.
+
+```powershell
+$acrAccessDeploymentName = "$deploymentName-acr-access"
+
+az deployment sub validate `
+  --subscription $subscriptionId `
+  --name "$acrAccessDeploymentName-validate" `
+  --location $location `
+  --template-file bicep/bootstrap.bicep `
+  --parameters resourceGroupName=$resourceGroupName `
+               containerRegistryName=$containerRegistryName `
+               imageRepositoryName=$imageRepositoryName `
+               deploymentOperatorPrincipalId=$deploymentOperatorPrincipalId `
+  --only-show-errors
+
+az deployment sub what-if `
+  --subscription $subscriptionId `
+  --name $acrAccessDeploymentName `
+  --location $location `
+  --template-file bicep/bootstrap.bicep `
+  --parameters resourceGroupName=$resourceGroupName `
+               containerRegistryName=$containerRegistryName `
+               imageRepositoryName=$imageRepositoryName `
+               deploymentOperatorPrincipalId=$deploymentOperatorPrincipalId `
+  --result-format FullResourcePayloads `
+  --output json `
+  --no-pretty-print |
+  Tee-Object -FilePath `
+    build/validation/004/live/acr-access-what-if.json
+```
+
+Inspect the saved preview. It may create or converge exactly one
+`Container Registry Repository Writer` role assignment at the existing ACR
+scope, conditioned to `html2b-render` for the current operator. Stop if it
+changes another resource, grants registry-wide access, or uses legacy
+`AcrPush`/`AcrPull`.
+
+Apply only after the bootstrap preview is accepted:
+
+```powershell
+az deployment sub create `
+  --subscription $subscriptionId `
+  --name $acrAccessDeploymentName `
+  --location $location `
+  --template-file bicep/bootstrap.bicep `
+  --parameters resourceGroupName=$resourceGroupName `
+               containerRegistryName=$containerRegistryName `
+               imageRepositoryName=$imageRepositoryName `
+               deploymentOperatorPrincipalId=$deploymentOperatorPrincipalId `
+  --query properties.outputs `
+  --output json |
+  Tee-Object -FilePath `
+    build/validation/004/live/acr-access-outputs.json
+```
+
+Build from a clean `git archive` of `$sourceSha`. Never pass the repository
+root to `az acr build`; ignored local files are not covered by the clean
+worktree check and must not enter the remote build context.
+
+```powershell
+$temporaryRoot = [System.IO.Path]::GetFullPath(
+  [System.IO.Path]::GetTempPath())
+$renderSourceArchive = Join-Path `
+  $temporaryRoot `
+  "html2b-render-$sourceSha.tar"
+$renderBuildContext = Join-Path `
+  $temporaryRoot `
+  "html2b-render-$sourceSha"
+
+foreach ($temporaryPath in @($renderSourceArchive, $renderBuildContext)) {
+    $resolvedCandidate = [System.IO.Path]::GetFullPath($temporaryPath)
+    if (-not $resolvedCandidate.StartsWith(
+        $temporaryRoot,
+        [System.StringComparison]::OrdinalIgnoreCase)) {
+        throw "Temporary path escaped the temporary directory: $temporaryPath"
+    }
+    if (Test-Path -LiteralPath $temporaryPath) {
+        throw "Temporary deployment path already exists: $temporaryPath"
+    }
+}
+
+New-Item -ItemType Directory -Path $renderBuildContext |
+  Out-Null
+
+try {
+    git archive `
+      --format=tar `
+      --output=$renderSourceArchive `
+      $sourceSha
+    if ($LASTEXITCODE -ne 0) {
+        throw "Could not archive Git commit $sourceSha."
+    }
+
+    tar -xf $renderSourceArchive -C $renderBuildContext
+    if ($LASTEXITCODE -ne 0) {
+        throw 'Could not extract the clean Render build context.'
+    }
+
+    az acr build `
+      --subscription $subscriptionId `
+      --resource-group $resourceGroupName `
+      --registry $containerRegistryName `
+      --source-acr-auth-id '[caller]' `
+      --image "${imageRepositoryName}:$sourceSha" `
+      --file "$renderBuildContext/src/api/Html2b.Render/Dockerfile" `
+      $renderBuildContext
+    if ($LASTEXITCODE -ne 0) {
+        throw 'The Render ACR build failed.'
+    }
+}
+finally {
+    if (Test-Path -LiteralPath $renderSourceArchive) {
+        Remove-Item -LiteralPath $renderSourceArchive -Force
+    }
+    if (Test-Path -LiteralPath $renderBuildContext) {
+        Remove-Item -LiteralPath $renderBuildContext -Recurse -Force
+    }
+}
+
+$publishedTag = az acr repository show-tags `
+  --subscription $subscriptionId `
+  --name $containerRegistryName `
+  --repository $imageRepositoryName `
+  --query "[?@=='$sourceSha'] | [0]" `
+  --output tsv
+
+if ($publishedTag -ne $sourceSha) {
+    throw "Render image tag $sourceSha was not found in ACR."
+}
+
+$containerImageDigest = (
+  az acr manifest show-metadata `
+    --subscription $subscriptionId `
+    --registry $containerRegistryName `
+    --name "${imageRepositoryName}:$sourceSha" `
+    --query digest `
+    --output tsv
+).Trim()
+
+if ($containerImageDigest -notmatch '^sha256:[0-9a-f]{64}$') {
+    throw 'Could not resolve the Render image manifest digest.'
+}
+
+$containerImage =
+  "${containerRegistryName}.azurecr.io/${imageRepositoryName}@$containerImageDigest"
+
+[pscustomobject]@{
+    ContainerImageTag = $containerImageTag
+    ContainerImage = $containerImage
+} | Format-List
+```
+
+Stop if the build is unauthorized. Correct the missing control-plane
+permission or the reviewed bootstrap Bicep; do not add a broad portal role as
+an undocumented workaround. Bicep must receive the digest-qualified
+`$containerImage`, never the mutable tag.
+
+### T009: Validate, preview, and apply the two-host Bicep
+
+Validate:
+
+```powershell
+az deployment sub validate `
+  --subscription $subscriptionId `
+  --name "$deploymentName-validate" `
+  --location $location `
+  --template-file bicep/main.bicep `
+  --parameters "@build/validation/004/bicep/dev.parameters.json" `
+               containerImage=$containerImage `
+  --only-show-errors
+```
+
+Preview and save the full payload:
+
+```powershell
+az deployment sub what-if `
+  --subscription $subscriptionId `
+  --name $deploymentName `
+  --location $location `
+  --template-file bicep/main.bicep `
+  --parameters "@build/validation/004/bicep/dev.parameters.json" `
+               containerImage=$containerImage `
+  --result-format FullResourcePayloads `
+  --output json `
+  --no-pretty-print |
+  Tee-Object -FilePath `
+    build/validation/004/live/deployment-what-if.json
+```
+
+Treat the full-payload file as potentially sensitive because ARM What-If may
+expand values derived from resource functions. Keep it in the ignored
+`build/validation/004/live/` directory and do not commit or share it without
+inspection.
+
+For the first deployment, the preview creates the Function storage, Flex plan,
+Application Insights, Function App, Render identity, Render Container App, and
+repository-scoped Reader role. Inspect the exact Render digest, 1 vCPU/2 GiB
+sizing, 0-1 scaling, concurrency 1, external HTTPS ingress, Function memory
+2,048 MB, maximum Function instances 1, generated Render URL, and resource
+group tags.
+
+Stop if the preview deletes a resource; changes `ca-html2b-dev`; replaces ACR,
+Log Analytics, or the Container Apps environment; creates private-networking
+resources; enables insecure public serving; or includes an unexpected role,
+identity, image, or parameter.
+
+Apply only after the saved preview is accepted:
+
+```powershell
+az deployment sub create `
+  --subscription $subscriptionId `
+  --name $deploymentName `
+  --location $location `
+  --template-file bicep/main.bicep `
+  --parameters "@build/validation/004/bicep/dev.parameters.json" `
+               containerImage=$containerImage `
+  --query properties.outputs `
+  --output json |
+  Tee-Object -FilePath `
+    build/validation/004/live/deployment-outputs.json
+```
+
+### T010: Publish the matching Function package
+
+Recheck the source, publish the Function App, record the ZIP hash beside the
+Render digest, and deploy the ZIP:
+
+```powershell
+if ((git rev-parse HEAD).Trim() -ne $sourceSha -or
+    @(git status --porcelain).Count -ne 0) {
+    throw 'Git changed after artifact identifiers were selected.'
+}
+
+if ((Test-Path -LiteralPath $functionPublishDirectory) -or
+    (Test-Path -LiteralPath $functionZip)) {
+    throw 'Function publish output already exists; use a clean artifact path.'
+}
+
+dotnet publish `
+  src/api/Html2b.AzureFunctions/Html2b.AzureFunctions.csproj `
+  --configuration Release `
+  --no-restore `
+  --output $functionPublishDirectory
+
+if (-not (Test-Path "$functionPublishDirectory/host.json")) {
+    throw 'host.json is not at the publish-output root.'
+}
+
+$publishedLocalSettings = @(
+  Get-ChildItem `
+    -LiteralPath $functionPublishDirectory `
+    -Filter local.settings.json `
+    -File `
+    -Recurse
+)
+if ($publishedLocalSettings.Count -ne 0) {
+    throw 'The Function publish output contains local.settings.json.'
+}
+
+Compress-Archive `
+  -Path "$functionPublishDirectory/*" `
+  -DestinationPath $functionZip `
+  -CompressionLevel Optimal `
+  -Force
+
+$functionZipHash = (
+  Get-FileHash -LiteralPath $functionZip -Algorithm SHA256
+).Hash.ToLowerInvariant()
+
+[ordered]@{
+    sourceSha = $sourceSha
+    containerImage = $containerImage
+    functionZip = $functionZip
+    functionZipSha256 = $functionZipHash
+} |
+  ConvertTo-Json |
+  Set-Content -LiteralPath $releaseManifestPath -Encoding utf8
+
+az functionapp deployment source config-zip `
+  --subscription $subscriptionId `
+  --resource-group $resourceGroupName `
+  --name $functionAppName `
+  --src $functionZip `
+  --timeout 600 `
+  --output none
+```
+
+Keep the sanitized `release-$sourceSha.json` as the link between the clean Git
+commit, immutable Render digest, and Function ZIP hash.
+
+### T011: Verify both public hosts
+
+Read the generated host names and Function configuration. Flex Consumption
+values are under `properties.functionAppConfig`; the Function host name is
+under `properties.defaultHostName`.
+
+```powershell
+$functionHostName = (
+  az functionapp show `
+    --subscription $subscriptionId `
+    --resource-group $resourceGroupName `
+    --name $functionAppName `
+    --query properties.defaultHostName `
+    --output tsv
+).Trim()
+
+$renderHostName = (
+  az containerapp show `
+    --subscription $subscriptionId `
+    --resource-group $resourceGroupName `
+    --name $renderContainerAppName `
+    --query properties.configuration.ingress.fqdn `
+    --output tsv
+).Trim()
+
+$configuredRenderUrl = (
+  az functionapp config appsettings list `
+    --subscription $subscriptionId `
+    --resource-group $resourceGroupName `
+    --name $functionAppName `
+    --query "[?name=='RenderService__BaseUrl'].value | [0]" `
+    --output tsv
+).Trim()
+
+[pscustomobject]@{
+    FunctionUrl = "https://$functionHostName"
+    RenderUrl = "https://$renderHostName"
+    ConfiguredRenderUrl = $configuredRenderUrl
+} | Format-List
+```
+
+Verify Function, Render, and repository-role state:
+
+```powershell
+az functionapp show `
+  --subscription $subscriptionId `
+  --resource-group $resourceGroupName `
+  --name $functionAppName `
+  --query "{Name:name,State:properties.state,Host:properties.defaultHostName,HttpsOnly:properties.httpsOnly,PublicNetworkAccess:properties.publicNetworkAccess,Runtime:properties.functionAppConfig.runtime,ScaleAndConcurrency:properties.functionAppConfig.scaleAndConcurrency}" `
+  --output yaml
+
+az containerapp show `
+  --subscription $subscriptionId `
+  --resource-group $resourceGroupName `
+  --name $renderContainerAppName `
+  --query "{Name:name,State:properties.provisioningState,IngressExternal:properties.configuration.ingress.external,AllowInsecure:properties.configuration.ingress.allowInsecure,LatestRevision:properties.latestRevisionName,ReadyRevision:properties.latestReadyRevisionName,Image:properties.template.containers[0].image,Cpu:properties.template.containers[0].resources.cpu,Memory:properties.template.containers[0].resources.memory,MinReplicas:properties.template.scale.minReplicas,MaxReplicas:properties.template.scale.maxReplicas,HttpConcurrency:properties.template.scale.rules[0].http.metadata.concurrentRequests}" `
+  --output yaml
+
+$acrResourceId = (
+  az acr show `
+    --subscription $subscriptionId `
+    --resource-group $resourceGroupName `
+    --name $containerRegistryName `
+    --query id `
+    --output tsv
+).Trim()
+
+$renderPrincipalId = (
+  az identity show `
+    --subscription $subscriptionId `
+    --resource-group $resourceGroupName `
+    --name $renderIdentityName `
+    --query principalId `
+    --output tsv
+).Trim()
+
+az role assignment list `
+  --subscription $subscriptionId `
+  --scope $acrResourceId `
+  --assignee-object-id $deploymentOperatorPrincipalId `
+  --query "[?roleDefinitionName=='Container Registry Repository Writer'].{Role:roleDefinitionName,Scope:scope,Condition:condition,ConditionVersion:conditionVersion}" `
+  --output yaml
+
+az role assignment list `
+  --subscription $subscriptionId `
+  --scope $acrResourceId `
+  --assignee-object-id $renderPrincipalId `
+  --query "[?roleDefinitionName=='Container Registry Repository Reader'].{Role:roleDefinitionName,Scope:scope,Condition:condition,ConditionVersion:conditionVersion}" `
+  --output yaml
+```
+
+Expected state:
+
+- Function state is `Running`, HTTPS-only and public network access are
+  enabled, runtime is `dotnet-isolated` `10.0`, instance memory is `2048`, and
+  maximum instance count is `1`.
+- Render state is `Succeeded`, external ingress is `true`,
+  `AllowInsecure` is `false`, latest revision equals ready revision, and its
+  image equals `$containerImage`.
+- Render has 1 vCPU, 2 GiB memory, 0-1 replicas, and HTTP concurrency 1.
+- `$configuredRenderUrl` equals `https://$renderHostName`.
+- Exactly one repository-scoped Writer applies to the operator and one
+  repository-scoped Reader applies to the Render identity; both conditions
+  name only `html2b-render`.
+
+Poll all four health endpoints inside one bounded 10-minute window. On timeout,
+save Azure state and stop before the render request.
+
+```powershell
+$healthDeadline = [DateTimeOffset]::UtcNow.AddMinutes(10)
+
+function Wait-HealthEndpoint {
+    param(
+        [Parameter(Mandatory)]
+        [string] $Uri,
+
+        [Parameter(Mandatory)]
+        [DateTimeOffset] $Deadline
+    )
+
+    $lastError = 'No response received.'
+
+    do {
+        try {
+            return Invoke-RestMethod `
+              -Uri $Uri `
+              -Method Get `
+              -TimeoutSec 30
+        }
+        catch {
+            $lastError = $_.Exception.Message
+            Start-Sleep -Seconds 5
+        }
+    } while ([DateTimeOffset]::UtcNow -lt $Deadline)
+
+    throw "Timed out waiting for $Uri. Last error: $lastError"
+}
+
+try {
+    $renderLive = Wait-HealthEndpoint `
+      -Uri "https://$renderHostName/health/live" `
+      -Deadline $healthDeadline
+    $renderReady = Wait-HealthEndpoint `
+      -Uri "https://$renderHostName/health/ready" `
+      -Deadline $healthDeadline
+    $live = Wait-HealthEndpoint `
+      -Uri "https://$functionHostName/health/live" `
+      -Deadline $healthDeadline
+    $ready = Wait-HealthEndpoint `
+      -Uri "https://$functionHostName/health/ready" `
+      -Deadline $healthDeadline
+}
+catch {
+    az functionapp show `
+      --subscription $subscriptionId `
+      --resource-group $resourceGroupName `
+      --name $functionAppName `
+      --query "{Name:name,State:properties.state,Host:properties.defaultHostName,FunctionAppConfig:properties.functionAppConfig}" `
+      --output json `
+      --no-pretty-print |
+      Set-Content `
+        -LiteralPath build/validation/004/live/timeout-function-state.json `
+        -Encoding utf8
+
+    az containerapp show `
+      --subscription $subscriptionId `
+      --resource-group $resourceGroupName `
+      --name $renderContainerAppName `
+      --query "{Name:name,State:properties.provisioningState,LatestRevision:properties.latestRevisionName,ReadyRevision:properties.latestReadyRevisionName,Image:properties.template.containers[0].image}" `
+      --output json `
+      --no-pretty-print |
+      Set-Content `
+        -LiteralPath build/validation/004/live/timeout-render-state.json `
+        -Encoding utf8
+
+    throw
+}
+```
+
+Verify one PNG through Functions:
+
+```powershell
+$renderOutput = "build/validation/004/live/render-$sourceSha.png"
+$renderResponse = Invoke-WebRequest `
+  -Uri "https://$functionHostName/api/renders/png" `
+  -Method Post `
+  -OutFile $renderOutput `
+  -PassThru
+
+$pngBytes = [System.IO.File]::ReadAllBytes($renderOutput)
+if ($pngBytes.Length -lt 8) {
+    throw 'Render response is too short to contain a PNG signature.'
+}
+
+[pscustomobject]@{
+    RenderLive = $renderLive.status
+    RenderReady = $renderReady.status
+    FunctionLive = $live.status
+    FunctionReady = $ready.status
+    RenderHttpStatus = $renderResponse.StatusCode
+    RenderContentType = $renderResponse.Headers.'Content-Type'
+    RenderBytes = $pngBytes.Length
+    PngSignature = [BitConverter]::ToString($pngBytes[0..7])
+} | Format-List
+```
+
+Expected health values are `live`, `ready`, `live`, and `ready`. The render
+request must return `200`, `image/png`, a non-empty body, and signature
+`89-50-4E-47-0D-0A-1A-0A`.
+
+Verify that public HTTP does not serve Render content:
+
+```powershell
+$handler = [System.Net.Http.HttpClientHandler]::new()
+$handler.AllowAutoRedirect = $false
+$client = [System.Net.Http.HttpClient]::new($handler)
+
+try {
+    $httpResponse = $client.GetAsync(
+      "http://$renderHostName/health/live").GetAwaiter().GetResult()
+
+    [pscustomobject]@{
+        StatusCode = [int] $httpResponse.StatusCode
+        Location = $httpResponse.Headers.Location
+    } | Format-List
+
+    if ([int] $httpResponse.StatusCode -eq 200) {
+        throw 'Render unexpectedly served content over public HTTP.'
+    }
+}
+finally {
+    $client.Dispose()
+    $handler.Dispose()
+}
+```
+
+Finally, prove the retained legacy app is unchanged:
+
+```powershell
+$legacyAppAfterPath =
+  'build/validation/004/live/legacy-app-after.json'
+
+az containerapp show `
+  --subscription $subscriptionId `
+  --resource-group $resourceGroupName `
+  --name ca-html2b-dev `
+  --query "{Name:name,Location:location,State:properties.provisioningState,Identity:identity,Ingress:properties.configuration.ingress,Template:properties.template,Tags:tags,LatestRevision:properties.latestRevisionName,LatestReadyRevision:properties.latestReadyRevisionName}" `
+  --output json `
+  --no-pretty-print |
+  Set-Content -LiteralPath $legacyAppAfterPath -Encoding utf8
+
+$legacyAppAfterHash = (
+  Get-FileHash -LiteralPath $legacyAppAfterPath -Algorithm SHA256
+).Hash.ToLowerInvariant()
+
+if ($legacyAppAfterHash -ne $legacyAppBeforeHash) {
+    throw 'The retained ca-html2b-dev configuration changed.'
+}
+```
+
+### Repeat What-If
+
+After a successful release, rerun and save the full-payload preview with the
+same digest:
+
+```powershell
+az deployment sub what-if `
+  --subscription $subscriptionId `
+  --name "$deploymentName-repeat" `
+  --location $location `
+  --template-file bicep/main.bicep `
+  --parameters "@build/validation/004/bicep/dev.parameters.json" `
+               containerImage=$containerImage `
+  --result-format FullResourcePayloads `
+  --output json `
+  --no-pretty-print |
+  Tee-Object -FilePath `
+    "build/validation/004/live/repeat-what-if-$sourceSha.json"
+```
+
+Inspect exact property deltas. ARM What-If can report false-positive
+modifications for provider defaults, generated identity properties, and values
+derived from `listKeys()`. The verified first repeat preview reported no
+deletes, no `ca-html2b-dev` changes, and no private-networking changes, but it
+did report provider-derived noise on the Reader assignment, Render identity,
+storage blob resources, and Function App. Do not treat a reported `Modify` as
+safe without reviewing its property-level delta.
+
+### Rollback
+
+The July 24 release is the first complete release in which both artifacts use
+the current HTTPS two-host contract. There is no prior matching full release
+to restore. The rollback procedure is recorded now, but a live rollback drill
+must wait until a later complete release has been deployed and this release is
+its valid previous target. Do not use a pre-Feature 004 commit as a substitute.
+
+For a future rollback, rebuild both artifacts from the exact previous deployed
+Git commit. Do not depend on an old local ZIP, mutable image tag, repository
+root build context, or traffic-only edit.
+
+Prepare the rollback artifacts from a clean `git archive`:
+
+```powershell
+$previousSha = '<previous deployed 40-character Git SHA>'
+if ($previousSha -notmatch '^[0-9a-f]{40}$') {
+    throw 'Rollback requires a full previous Git commit SHA.'
+}
+
+git cat-file -e "$previousSha^{commit}"
+if ($LASTEXITCODE -ne 0) {
+    throw "Git commit $previousSha is not available locally."
+}
+
+$temporaryRoot = [System.IO.Path]::GetFullPath(
+  [System.IO.Path]::GetTempPath())
+$rollbackArchive = Join-Path `
+  $temporaryRoot `
+  "html2b-rollback-$previousSha.tar"
+$rollbackSourceDirectory = Join-Path `
+  $temporaryRoot `
+  "html2b-rollback-$previousSha"
+
+foreach ($temporaryPath in @($rollbackArchive, $rollbackSourceDirectory)) {
+    $resolvedCandidate = [System.IO.Path]::GetFullPath($temporaryPath)
+    if (-not $resolvedCandidate.StartsWith(
+        $temporaryRoot,
+        [System.StringComparison]::OrdinalIgnoreCase)) {
+        throw "Rollback path escaped the temporary directory: $temporaryPath"
+    }
+    if (Test-Path -LiteralPath $temporaryPath) {
+        throw "Rollback path already exists: $temporaryPath"
+    }
+}
+
+$previousFunctionPublishDirectory =
+  "build/rollback/functions-$previousSha"
+$previousFunctionZip =
+  "build/rollback/html2b-functions-$previousSha.zip"
+$rollbackDeploymentName =
+  "html2b-rollback-$($previousSha.Substring(0, 12))"
+
+New-Item -ItemType Directory -Path $rollbackSourceDirectory |
+  Out-Null
+
+try {
+    git archive `
+      --format=tar `
+      --output=$rollbackArchive `
+      $previousSha
+    if ($LASTEXITCODE -ne 0) {
+        throw "Could not archive rollback commit $previousSha."
+    }
+
+    tar -xf $rollbackArchive -C $rollbackSourceDirectory
+    if ($LASTEXITCODE -ne 0) {
+        throw 'Could not extract the clean rollback source.'
+    }
+
+    az acr build `
+      --subscription $subscriptionId `
+      --resource-group $resourceGroupName `
+      --registry $containerRegistryName `
+      --source-acr-auth-id '[caller]' `
+      --image "${imageRepositoryName}:rollback-$previousSha" `
+      --file "$rollbackSourceDirectory/src/api/Html2b.Render/Dockerfile" `
+      $rollbackSourceDirectory
+    if ($LASTEXITCODE -ne 0) {
+        throw 'The rollback Render build failed.'
+    }
+
+    $previousImageDigest = (
+      az acr manifest show-metadata `
+        --subscription $subscriptionId `
+        --registry $containerRegistryName `
+        --name "${imageRepositoryName}:rollback-$previousSha" `
+        --query digest `
+        --output tsv
+    ).Trim()
+
+    if ($previousImageDigest -notmatch '^sha256:[0-9a-f]{64}$') {
+        throw 'Could not resolve the rollback image manifest digest.'
+    }
+
+    $previousImage =
+      "${containerRegistryName}.azurecr.io/${imageRepositoryName}@$previousImageDigest"
+
+    dotnet restore `
+      "$rollbackSourceDirectory/src/api/Html2b.slnx"
+    if ($LASTEXITCODE -ne 0) {
+        throw 'Rollback restore failed.'
+    }
+
+    dotnet publish `
+      "$rollbackSourceDirectory/src/api/Html2b.AzureFunctions/Html2b.AzureFunctions.csproj" `
+      --configuration Release `
+      --no-restore `
+      --output $previousFunctionPublishDirectory
+    if ($LASTEXITCODE -ne 0) {
+        throw 'Rollback Function publish failed.'
+    }
+
+    if (-not (Test-Path "$previousFunctionPublishDirectory/host.json")) {
+        throw 'Rollback host.json is not at the publish-output root.'
+    }
+
+    $rollbackLocalSettings = @(
+      Get-ChildItem `
+        -LiteralPath $previousFunctionPublishDirectory `
+        -Filter local.settings.json `
+        -File `
+        -Recurse
+    )
+    if ($rollbackLocalSettings.Count -ne 0) {
+        throw 'Rollback Function output contains local.settings.json.'
+    }
+
+    Compress-Archive `
+      -Path "$previousFunctionPublishDirectory/*" `
+      -DestinationPath $previousFunctionZip `
+      -CompressionLevel Optimal `
+      -Force
+
+    $previousFunctionZipHash = (
+      Get-FileHash -LiteralPath $previousFunctionZip -Algorithm SHA256
+    ).Hash.ToLowerInvariant()
+
+    [ordered]@{
+        sourceSha = $previousSha
+        containerImage = $previousImage
+        functionZip = $previousFunctionZip
+        functionZipSha256 = $previousFunctionZipHash
+    } |
+      ConvertTo-Json |
+      Set-Content -LiteralPath `
+        "build/validation/004/live/rollback-release-$previousSha.json" `
+        -Encoding utf8
+}
+finally {
+    if (Test-Path -LiteralPath $rollbackArchive) {
+        Remove-Item -LiteralPath $rollbackArchive -Force
+    }
+    if (Test-Path -LiteralPath $rollbackSourceDirectory) {
+        Remove-Item `
+          -LiteralPath $rollbackSourceDirectory `
+          -Recurse `
+          -Force
+    }
+}
+```
+
+Preview the rollback in its own command block:
+
+```powershell
+az deployment sub what-if `
+  --subscription $subscriptionId `
+  --name $rollbackDeploymentName `
+  --location $location `
+  --template-file bicep/main.bicep `
+  --parameters "@build/validation/004/bicep/dev.parameters.json" `
+               containerImage=$previousImage `
+  --result-format FullResourcePayloads `
+  --output json `
+  --no-pretty-print |
+  Tee-Object -FilePath `
+    "build/validation/004/live/rollback-what-if-$previousSha.json"
+```
+
+Stop here. Inspect the saved full payload and obtain approval before either
+live mutation. The preview must not delete resources, change the retained
+legacy app, introduce private networking, or select an unexpected image.
+
+Only after that review, apply the Bicep and deploy the rebuilt Function ZIP:
+
+```powershell
+az deployment sub create `
+  --subscription $subscriptionId `
+  --name $rollbackDeploymentName `
+  --location $location `
+  --template-file bicep/main.bicep `
+  --parameters "@build/validation/004/bicep/dev.parameters.json" `
+               containerImage=$previousImage `
+  --output none
+
+az functionapp deployment source config-zip `
+  --subscription $subscriptionId `
+  --resource-group $resourceGroupName `
+  --name $functionAppName `
+  --src $previousFunctionZip `
+  --timeout 600 `
+  --output none
+```
+
+Set `$sourceSha` to `$previousSha` and `$containerImage` to `$previousImage`,
+then rerun every T011 state, role, health, render, public-HTTP, and retained-app
+check. Keep the rollback manifest, preview, Function ZIP hash, and Render
+digest as evidence. Do not delete failed revisions or ACR images as part of
+rollback.
 
 ## How it works
 
