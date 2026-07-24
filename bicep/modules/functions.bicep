@@ -10,6 +10,12 @@ param functionAppName string
 param functionDeploymentContainerName string
 param functionRuntime string
 param functionRuntimeVersion string
+@allowed([
+  512
+  2048
+  4096
+])
+param functionInstanceMemoryMb int
 param renderServiceBaseUrl string
 
 var functionTags = union(baseTags, {
@@ -129,6 +135,9 @@ resource functionApp 'Microsoft.Web/sites@2024-04-01' = {
             storageAccountConnectionStringName: 'DEPLOYMENT_STORAGE_CONNECTION_STRING'
           }
         }
+      }
+      scaleAndConcurrency: {
+        instanceMemoryMB: functionInstanceMemoryMb
       }
       runtime: {
         name: functionRuntime

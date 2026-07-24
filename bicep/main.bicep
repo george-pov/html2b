@@ -14,6 +14,12 @@ param functionAppName string
 param functionDeploymentContainerName string
 param functionRuntime string
 param functionRuntimeVersion string
+@allowed([
+  512
+  2048
+  4096
+])
+param functionInstanceMemoryMb int
 param renderIdentityName string
 param renderContainerAppName string
 param renderCpu int
@@ -81,6 +87,7 @@ module functionsDeployment 'modules/functions.bicep' = {
     functionDeploymentContainerName: functionDeploymentContainerName
     functionRuntime: functionRuntime
     functionRuntimeVersion: functionRuntimeVersion
+    functionInstanceMemoryMb: functionInstanceMemoryMb
     renderServiceBaseUrl: renderContainerDeployment.outputs.renderContainerAppUrl
   }
 }
