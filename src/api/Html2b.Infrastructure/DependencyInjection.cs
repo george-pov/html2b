@@ -18,7 +18,7 @@ public static class DependencyInjection
             .Bind(configuration.GetSection(RenderServiceOptions.SectionName))
             .Validate(
                 options => TryGetValidBaseUri(options.BaseUrl, out _),
-                $"{RenderServiceOptions.SectionName}:BaseUrl must be an absolute HTTP URI.")
+                $"{RenderServiceOptions.SectionName}:BaseUrl must be an absolute HTTP or HTTPS URI.")
             .ValidateOnStart();
 
         services.AddHttpClient<PocRenderHttpClient>(
@@ -44,7 +44,8 @@ public static class DependencyInjection
     private static bool TryGetValidBaseUri(string value, out Uri? uri)
     {
         if (Uri.TryCreate(value, UriKind.Absolute, out uri) &&
-            string.Equals(uri.Scheme, Uri.UriSchemeHttp, StringComparison.OrdinalIgnoreCase))
+            (string.Equals(uri.Scheme, Uri.UriSchemeHttp, StringComparison.OrdinalIgnoreCase) ||
+             string.Equals(uri.Scheme, Uri.UriSchemeHttps, StringComparison.OrdinalIgnoreCase)))
         {
             return true;
         }
