@@ -9,6 +9,11 @@ var repositoryWriterRoleDefinitionResourceId = subscriptionResourceId(
   'Microsoft.Authorization/roleDefinitions',
   '2a1e307c-b015-4ebd-883e-5b7698a07328'
 )
+// Feature 002 already created this principal/role/scope assignment for the
+// retired html2b-api publication path. Azure permits only one assignment for
+// that tuple, so retain its deterministic name while narrowing its condition
+// to the current html2b-render repository.
+var existingOperatorRepositoryName = 'html2b-api'
 var operatorRepositoryWriterCondition = '((!(ActionMatches{\'Microsoft.ContainerRegistry/registries/repositories/content/read\'}) AND !(ActionMatches{\'Microsoft.ContainerRegistry/registries/repositories/content/write\'}) AND !(ActionMatches{\'Microsoft.ContainerRegistry/registries/repositories/metadata/read\'}) AND !(ActionMatches{\'Microsoft.ContainerRegistry/registries/repositories/metadata/write\'})) OR (@Request[Microsoft.ContainerRegistry/registries/repositories:name] StringEqualsIgnoreCase \'${imageRepositoryName}\'))'
 
 resource containerRegistry 'Microsoft.ContainerRegistry/registries@2025-11-01' existing = {
@@ -20,7 +25,7 @@ resource operatorRepositoryWriterRoleAssignment 'Microsoft.Authorization/roleAss
     containerRegistryResourceId,
     deploymentOperatorPrincipalId,
     repositoryWriterRoleDefinitionResourceId,
-    imageRepositoryName
+    existingOperatorRepositoryName
   )
   scope: containerRegistry
   properties: {

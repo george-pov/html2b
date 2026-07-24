@@ -4,3 +4,4 @@ build
 .vs
 **/bin
 **/obj
+**/local.settings.json
