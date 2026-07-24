@@ -20,6 +20,9 @@ param functionRuntimeVersion string
   4096
 ])
 param functionInstanceMemoryMb int
+@minValue(1)
+@maxValue(1000)
+param functionMaximumInstanceCount int
 param renderIdentityName string
 param renderContainerAppName string
 param renderCpu int
@@ -88,6 +91,7 @@ module functionsDeployment 'modules/functions.bicep' = {
     functionRuntime: functionRuntime
     functionRuntimeVersion: functionRuntimeVersion
     functionInstanceMemoryMb: functionInstanceMemoryMb
+    functionMaximumInstanceCount: functionMaximumInstanceCount
     renderServiceBaseUrl: renderContainerDeployment.outputs.renderContainerAppUrl
   }
 }

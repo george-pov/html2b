@@ -16,6 +16,9 @@ param functionRuntimeVersion string
   4096
 ])
 param functionInstanceMemoryMb int
+@minValue(1)
+@maxValue(1000)
+param functionMaximumInstanceCount int
 param renderServiceBaseUrl string
 
 var functionTags = union(baseTags, {
@@ -138,6 +141,7 @@ resource functionApp 'Microsoft.Web/sites@2024-04-01' = {
       }
       scaleAndConcurrency: {
         instanceMemoryMB: functionInstanceMemoryMb
+        maximumInstanceCount: functionMaximumInstanceCount
       }
       runtime: {
         name: functionRuntime

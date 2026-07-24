@@ -15,6 +15,7 @@ param functionDeploymentContainerName = 'function-releases'
 param functionRuntime = 'dotnet-isolated'
 param functionRuntimeVersion = '10.0'
 param functionInstanceMemoryMb = 2048
+param functionMaximumInstanceCount = 1
 param renderIdentityName = 'id-html2b-render-dev'
 param renderContainerAppName = 'ca-html2b-render-dev'
 param renderCpu = 1
