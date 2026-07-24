@@ -111,14 +111,6 @@ resource functionApp 'Microsoft.Web/sites@2024-04-01' = {
           value: functionStorageConnectionString
         }
         {
-          name: 'FUNCTIONS_WORKER_RUNTIME'
-          value: functionRuntime
-        }
-        {
-          name: 'FUNCTIONS_EXTENSION_VERSION'
-          value: '~4'
-        }
-        {
           name: 'APPLICATIONINSIGHTS_CONNECTION_STRING'
           value: applicationInsights.properties.ConnectionString
         }
