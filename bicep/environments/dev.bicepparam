@@ -17,6 +17,7 @@ param functionRuntimeVersion = '10.0'
 param functionInstanceMemoryMb = 2048
 param functionMaximumInstanceCount = 1
 param renderApiClientId = '78ae23b3-bca7-4129-bd47-532b96429a96'
+param renderAuthenticationEnabled = true
 param renderIdentityName = 'id-html2b-render-dev'
 param renderContainerAppName = 'ca-html2b-render-dev'
 param renderCpu = 1

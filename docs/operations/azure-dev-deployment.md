@@ -27,7 +27,7 @@ repository-scoped image access.
 
 ## Prerequisites
 
-- PowerShell 7.
+- PowerShell 7.3 or later.
 - Git.
 - .NET 10 SDK.
 - Azure CLI with Bicep.

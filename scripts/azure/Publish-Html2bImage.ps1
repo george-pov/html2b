@@ -10,6 +10,10 @@ param(
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 
+Import-Module `
+    (Join-Path $PSScriptRoot 'Html2b.OutputContracts.psm1') `
+    -Force
+
 function Resolve-RepositoryRoot {
     return (Resolve-Path (Join-Path $PSScriptRoot '..\..')).Path
 }
@@ -145,155 +149,6 @@ function Wait-HttpReady {
     throw "Timed out waiting for $Uri."
 }
 
-function Get-BigEndianUInt16 {
-    param(
-        [byte[]] $Bytes,
-        [int] $Offset
-    )
-
-    return ([int] $Bytes[$Offset] -shl 8) -bor [int] $Bytes[$Offset + 1]
-}
-
-function Get-BigEndianUInt32 {
-    param(
-        [byte[]] $Bytes,
-        [int] $Offset
-    )
-
-    return ([int64] $Bytes[$Offset] -shl 24) -bor
-        ([int64] $Bytes[$Offset + 1] -shl 16) -bor
-        ([int64] $Bytes[$Offset + 2] -shl 8) -bor
-        [int64] $Bytes[$Offset + 3]
-}
-
-function Assert-LocalOutputContract {
-    param(
-        [Parameter(Mandatory)]
-        [ValidateSet('png', 'jpeg', 'pdf')]
-        [string] $Format,
-
-        [Parameter(Mandatory)]
-        [byte[]] $Bytes,
-
-        [Parameter(Mandatory)]
-        [string] $ContentType,
-
-        [Parameter(Mandatory)]
-        [string] $FileName
-    )
-
-    $expectedContentType = @{
-        png = 'image/png'
-        jpeg = 'image/jpeg'
-        pdf = 'application/pdf'
-    }[$Format]
-    $expectedFileName = @{
-        png = 'html2b-poc.png'
-        jpeg = 'html2b-poc.jpg'
-        pdf = 'html2b-poc.pdf'
-    }[$Format]
-
-    if ($ContentType -ne $expectedContentType) {
-        throw "$Format returned content type '$ContentType' instead of '$expectedContentType'."
-    }
-
-    if ($FileName.Trim('"') -ne $expectedFileName) {
-        throw "$Format returned filename '$FileName' instead of '$expectedFileName'."
-    }
-
-    if ($Format -eq 'png') {
-        $signature = [byte[]] @(0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a)
-        for ($index = 0; $index -lt $signature.Length; $index++) {
-            if ($Bytes[$index] -ne $signature[$index]) {
-                throw 'PNG signature validation failed.'
-            }
-        }
-
-        $width = Get-BigEndianUInt32 -Bytes $Bytes -Offset 16
-        $height = Get-BigEndianUInt32 -Bytes $Bytes -Offset 20
-        if ($width -ne 1280 -or $height -ne 720) {
-            throw "PNG dimensions were ${width}x${height}, expected 1280x720."
-        }
-    }
-    elseif ($Format -eq 'jpeg') {
-        if ($Bytes.Length -lt 4 -or
-            $Bytes[0] -ne 0xff -or
-            $Bytes[1] -ne 0xd8 -or
-            $Bytes[-2] -ne 0xff -or
-            $Bytes[-1] -ne 0xd9) {
-            throw 'JPEG signature validation failed.'
-        }
-
-        $offset = 2
-        $width = 0
-        $height = 0
-        $startOfFrameMarkers = @(0xc0, 0xc1, 0xc2, 0xc3, 0xc5, 0xc6, 0xc7, 0xc9, 0xca, 0xcb, 0xcd, 0xce, 0xcf)
-        while ($offset + 8 -lt $Bytes.Length) {
-            if ($Bytes[$offset] -ne 0xff) {
-                $offset++
-                continue
-            }
-
-            while ($offset -lt $Bytes.Length -and $Bytes[$offset] -eq 0xff) {
-                $offset++
-            }
-
-            if ($offset -ge $Bytes.Length) {
-                break
-            }
-
-            $marker = $Bytes[$offset]
-            $offset++
-            if ($marker -eq 0xd8 -or $marker -eq 0xd9 -or ($marker -ge 0xd0 -and $marker -le 0xd7)) {
-                continue
-            }
-
-            $segmentLength = Get-BigEndianUInt16 -Bytes $Bytes -Offset $offset
-            if ($startOfFrameMarkers -contains $marker) {
-                $height = Get-BigEndianUInt16 -Bytes $Bytes -Offset ($offset + 3)
-                $width = Get-BigEndianUInt16 -Bytes $Bytes -Offset ($offset + 5)
-                break
-            }
-
-            $offset += $segmentLength
-        }
-
-        if ($width -ne 1280 -or $height -ne 720) {
-            throw "JPEG dimensions were ${width}x${height}, expected 1280x720."
-        }
-    }
-    else {
-        $header = [System.Text.Encoding]::ASCII.GetString($Bytes, 0, [Math]::Min(5, $Bytes.Length))
-        if ($header -ne '%PDF-') {
-            throw 'PDF signature validation failed.'
-        }
-
-        $pdfText = [System.Text.Encoding]::ASCII.GetString($Bytes)
-        $mediaBoxes = [regex]::Matches(
-            $pdfText,
-            '/MediaBox\s*\[\s*([-+]?\d*\.?\d+)\s+([-+]?\d*\.?\d+)\s+([-+]?\d*\.?\d+)\s+([-+]?\d*\.?\d+)\s*\]')
-        $validMediaBox = $false
-        foreach ($mediaBox in $mediaBoxes) {
-            $values = 1..4 | ForEach-Object {
-                [double]::Parse(
-                    $mediaBox.Groups[$_].Value,
-                    [System.Globalization.CultureInfo]::InvariantCulture)
-            }
-            if ([Math]::Abs($values[0]) -lt 0.1 -and
-                [Math]::Abs($values[1]) -lt 0.1 -and
-                [Math]::Abs($values[2] - 960) -lt 0.1 -and
-                [Math]::Abs($values[3] - 540) -lt 0.1) {
-                $validMediaBox = $true
-                break
-            }
-        }
-
-        if (-not $validMediaBox) {
-            throw 'PDF page box validation failed; expected 960 by 540 points.'
-        }
-    }
-}
-
 function Invoke-LocalContainerValidation {
     param(
         [Parameter(Mandatory)]
@@ -344,18 +199,10 @@ function Invoke-LocalContainerValidation {
                     }
 
                     $bytes = $response.Content.ReadAsByteArrayAsync().GetAwaiter().GetResult()
-                    $disposition = $response.Content.Headers.ContentDisposition
-                    if ($null -eq $disposition) {
-                        throw "$format render omitted Content-Disposition."
-                    }
-
-                    $fileName = if (-not [string]::IsNullOrWhiteSpace($disposition.FileNameStar)) {
-                        $disposition.FileNameStar
-                    }
-                    else {
-                        $disposition.FileName
-                    }
-                    Assert-LocalOutputContract `
+                    $fileName = Get-Html2bResponseFileName `
+                        -Disposition $response.Content.Headers.ContentDisposition `
+                        -Format $format
+                    $null = Assert-Html2bOutputContract `
                         -Format $format `
                         -Bytes $bytes `
                         -ContentType $response.Content.Headers.ContentType.MediaType `

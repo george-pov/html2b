@@ -26,6 +26,7 @@ param functionMaximumInstanceCount int
 @minLength(36)
 @maxLength(36)
 param renderApiClientId string
+param renderAuthenticationEnabled bool
 param renderIdentityName string
 param renderContainerAppName string
 param renderCpu int
@@ -102,6 +103,18 @@ module functionsDeployment 'modules/functions.bicep' = {
     functionMaximumInstanceCount: functionMaximumInstanceCount
     renderServiceBaseUrl: renderContainerDeployment.outputs.renderContainerAppUrl
     renderServiceAudience: renderServiceAudience
+  }
+}
+
+module renderAuthenticationDeployment 'modules/render-auth.bicep' = {
+  name: 'render-auth-${environmentName}'
+  scope: environmentResourceGroup
+  params: {
+    enabled: renderAuthenticationEnabled
+    tenantId: tenant().tenantId
+    renderApiClientId: renderApiClientId
+    functionPrincipalId: functionsDeployment.outputs.functionPrincipalId
+    renderContainerAppName: renderContainerDeployment.outputs.renderContainerAppName
   }
 }
 
