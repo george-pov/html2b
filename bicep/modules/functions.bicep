@@ -20,6 +20,7 @@ param functionInstanceMemoryMb int
 @maxValue(1000)
 param functionMaximumInstanceCount int
 param renderServiceBaseUrl string
+param renderServiceAudience string
 
 var functionTags = union(baseTags, {
   Component: 'Functions'
@@ -95,6 +96,9 @@ resource functionApp 'Microsoft.Web/sites@2024-04-01' = {
   location: location
   tags: functionTags
   kind: 'functionapp,linux'
+  identity: {
+    type: 'SystemAssigned'
+  }
   properties: {
     serverFarmId: functionPlan.id
     httpsOnly: true
@@ -117,6 +121,10 @@ resource functionApp 'Microsoft.Web/sites@2024-04-01' = {
         {
           name: 'RenderService__BaseUrl'
           value: renderServiceBaseUrl
+        }
+        {
+          name: 'RenderService__Audience'
+          value: renderServiceAudience
         }
       ]
     }
@@ -148,3 +156,4 @@ resource functionApp 'Microsoft.Web/sites@2024-04-01' = {
 
 output functionAppName string = functionApp.name
 output functionAppDefaultHostName string = functionApp.properties.defaultHostName
+output functionPrincipalId string = functionApp.identity.principalId

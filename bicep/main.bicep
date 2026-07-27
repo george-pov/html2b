@@ -23,6 +23,9 @@ param functionInstanceMemoryMb int
 @minValue(1)
 @maxValue(1000)
 param functionMaximumInstanceCount int
+@minLength(36)
+@maxLength(36)
+param renderApiClientId string
 param renderIdentityName string
 param renderContainerAppName string
 param renderCpu int
@@ -32,9 +35,14 @@ param renderMaxReplicas int
 param renderHttpConcurrency int
 param containerImage string = ''
 
+var renderServiceAudience = 'api://${renderApiClientId}'
+var normalizedRenderApiClientId = toLower(renderApiClientId)
+var renderApiClientIdWithoutSeparators = replace(normalizedRenderApiClientId, '-', '')
+var renderApiClientIdWithoutAllowedCharacters = replace(replace(replace(replace(replace(replace(replace(replace(replace(replace(replace(replace(replace(replace(replace(replace(renderApiClientIdWithoutSeparators, '0', ''), '1', ''), '2', ''), '3', ''), '4', ''), '5', ''), '6', ''), '7', ''), '8', ''), '9', ''), 'a', ''), 'b', ''), 'c', ''), 'd', ''), 'e', ''), 'f', '')
 var expectedContainerImagePrefix = '${containerRegistryName}.azurecr.io/${imageRepositoryName}@sha256:'
 var containerImageWithoutAllowedCharacters = replace(replace(replace(replace(replace(replace(replace(replace(replace(replace(replace(replace(replace(replace(replace(replace(replace(containerImage, expectedContainerImagePrefix, ''), '0', ''), '1', ''), '2', ''), '3', ''), '4', ''), '5', ''), '6', ''), '7', ''), '8', ''), '9', ''), 'a', ''), 'b', ''), 'c', ''), 'd', ''), 'e', ''), 'f', '')
 
+assert renderApiClientIdIsDFormatGuid = length(renderApiClientIdWithoutSeparators) == 32 && empty(renderApiClientIdWithoutAllowedCharacters) && substring(renderApiClientId, 8, 1) == '-' && substring(renderApiClientId, 13, 1) == '-' && substring(renderApiClientId, 18, 1) == '-' && substring(renderApiClientId, 23, 1) == '-'
 assert containerImageIsEmptyOrImmutable = empty(containerImage) || (startsWith(containerImage, expectedContainerImagePrefix) && length(containerImage) == length(expectedContainerImagePrefix) + 64 && containerImage == toLower(containerImage) && empty(containerImageWithoutAllowedCharacters))
 
 var baseTags = {
@@ -93,12 +101,14 @@ module functionsDeployment 'modules/functions.bicep' = {
     functionInstanceMemoryMb: functionInstanceMemoryMb
     functionMaximumInstanceCount: functionMaximumInstanceCount
     renderServiceBaseUrl: renderContainerDeployment.outputs.renderContainerAppUrl
+    renderServiceAudience: renderServiceAudience
   }
 }
 
 output resourceGroupName string = environmentResourceGroup.name
 output functionAppName string = functionsDeployment.outputs.functionAppName
 output functionAppDefaultHostName string = functionsDeployment.outputs.functionAppDefaultHostName
+output functionPrincipalId string = functionsDeployment.outputs.functionPrincipalId
 output renderContainerAppName string = renderContainerDeployment.outputs.renderContainerAppName
 output renderContainerAppFqdn string = renderContainerDeployment.outputs.renderContainerAppFqdn
 output renderContainerAppUrl string = renderContainerDeployment.outputs.renderContainerAppUrl
