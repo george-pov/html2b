@@ -4,6 +4,98 @@ $ErrorActionPreference = 'Stop'
 Import-Module `
     (Join-Path $PSScriptRoot 'Html2b.AzureStateValidation.psm1')
 
+function New-SanitizedDependencyAnalyticsQuery {
+    param(
+        [Parameter(Mandatory)]
+        [DateTimeOffset] $StartTime,
+
+        [Parameter(Mandatory)]
+        [DateTimeOffset] $EndTime,
+
+        [Parameter(Mandatory)]
+        [string] $RenderHostName
+    )
+
+    $startText = $StartTime.ToUniversalTime().ToString(
+        'yyyy-MM-dd HH:mm:ss.fffffff zzz',
+        [System.Globalization.CultureInfo]::InvariantCulture)
+    $endText = $EndTime.ToUniversalTime().ToString(
+        'yyyy-MM-dd HH:mm:ss.fffffff zzz',
+        [System.Globalization.CultureInfo]::InvariantCulture)
+    $escapedRenderHostName = $RenderHostName.Replace("'", "''")
+
+    return @(
+        'dependencies',
+        "| where timestamp >= todatetime('$startText')",
+        "| where timestamp <= todatetime('$endText')",
+        "| where target contains '$escapedRenderHostName'",
+        "or name contains '$escapedRenderHostName'",
+        "or data contains '$escapedRenderHostName'",
+        '| project timestamp, name, type, target, resultCode, success, duration,',
+        'operationId = operation_Id',
+        '| order by timestamp asc'
+    ) -join ' '
+}
+
+function ConvertFrom-SanitizedDependencyQueryResponse {
+    param(
+        [Parameter(Mandatory)]
+        [pscustomobject] $Response
+    )
+
+    $expectedColumns = @(
+        'timestamp',
+        'name',
+        'type',
+        'target',
+        'resultCode',
+        'success',
+        'duration',
+        'operationId'
+    )
+    $tables = @($Response.tables)
+    if ($tables.Count -ne 1) {
+        throw 'The sanitized dependency query returned an unexpected table count.'
+    }
+
+    $table = $tables[0]
+    $columns = @($table.columns)
+    if ($columns.Count -ne $expectedColumns.Count) {
+        throw 'The sanitized dependency query returned an unexpected schema.'
+    }
+    for ($index = 0; $index -lt $expectedColumns.Count; $index++) {
+        if ([string] $columns[$index].name -cne $expectedColumns[$index]) {
+            throw 'The sanitized dependency query returned an unexpected schema.'
+        }
+    }
+
+    $records = @()
+    foreach ($rowValue in @($table.rows)) {
+        $row = @($rowValue)
+        if ($row.Count -ne $expectedColumns.Count) {
+            throw 'The sanitized dependency query returned an unexpected schema.'
+        }
+
+        $records += [ordered]@{
+            timestamp = [string] $row[0]
+            name = [string] $row[1]
+            type = [string] $row[2]
+            target = [string] $row[3]
+            resultCode = [string] $row[4]
+            success = if ($null -eq $row[5]) {
+                $null
+            }
+            else {
+                [bool] $row[5]
+            }
+            duration = [string] $row[6]
+            operationId = [string] $row[7]
+        }
+    }
+
+    return $records
+}
+
 function Get-SanitizedDependencyTelemetry {
     param(
         [Parameter(Mandatory)]
@@ -31,18 +123,10 @@ function Get-SanitizedDependencyTelemetry {
     $endText = $EndTime.ToUniversalTime().ToString(
         'yyyy-MM-dd HH:mm:ss.fffffff zzz',
         [System.Globalization.CultureInfo]::InvariantCulture)
-    $escapedRenderHostName = $RenderHostName.Replace("'", "''")
-    $analyticsQuery = @"
-dependencies
-| where timestamp >= todatetime('$startText')
-| where timestamp <= todatetime('$endText')
-| where target contains '$escapedRenderHostName'
-    or name contains '$escapedRenderHostName'
-    or data contains '$escapedRenderHostName'
-| project timestamp, name, type, target, resultCode, success, duration,
-    operationId = operation_Id
-| order by timestamp asc
-"@
+    $analyticsQuery = New-SanitizedDependencyAnalyticsQuery `
+        -StartTime $StartTime `
+        -EndTime $EndTime `
+        -RenderHostName $RenderHostName
 
     $json = Invoke-AzureCli `
         -Subscription $Subscription `
@@ -54,39 +138,54 @@ dependencies
             '--analytics-query', $analyticsQuery,
             '--start-time', $startText,
             '--end-time', $endText,
-            '--query', 'tables[0].rows',
             '--output', 'json'
         )
-    $rows = ConvertFrom-AzureCliJson `
+    $response = ConvertFrom-AzureCliJson `
         -Json $json `
         -Operation 'query sanitized Function dependency telemetry'
 
-    $records = @()
-    foreach ($row in @(
-            $rows |
-                Where-Object { $null -ne $_ })) {
-        if (@($row).Count -ne 8) {
-            throw 'The sanitized dependency query returned an unexpected schema.'
-        }
+    return ConvertFrom-SanitizedDependencyQueryResponse -Response $response
+}
 
-        $records += [ordered]@{
-            timestamp = [string] $row[0]
-            name = [string] $row[1]
-            type = [string] $row[2]
-            target = [string] $row[3]
-            resultCode = [string] $row[4]
-            success = if ($null -eq $row[5]) {
-                $null
-            }
-            else {
-                [bool] $row[5]
-            }
-            duration = [string] $row[6]
-            operationId = [string] $row[7]
-        }
-    }
+function Test-RenderDependencyEvidenceRecord {
+    param(
+        [Parameter(Mandatory)]
+        [object] $Record,
 
-    return $records
+        [Parameter(Mandatory)]
+        [string] $RenderHostName
+    )
+
+    [TimeSpan] $duration = [TimeSpan]::Zero
+    $hasPositiveDuration = [TimeSpan]::TryParse(
+        [string] $Record.duration,
+        [System.Globalization.CultureInfo]::InvariantCulture,
+        [ref] $duration) -and $duration -gt [TimeSpan]::Zero
+    $hasExpectedName =
+        [string]::Equals(
+            [string] $Record.name,
+            'POST /internal/renders',
+            [StringComparison]::OrdinalIgnoreCase) -or
+        [string]::Equals(
+            [string] $Record.name,
+            'GET /health/ready',
+            [StringComparison]::OrdinalIgnoreCase)
+
+    return (
+        [string]::Equals(
+            [string] $Record.target,
+            $RenderHostName,
+            [StringComparison]::OrdinalIgnoreCase) -and
+        [string]::Equals(
+            [string] $Record.type,
+            'Http',
+            [StringComparison]::OrdinalIgnoreCase) -and
+        [string] $Record.resultCode -ceq '200' -and
+        $Record.success -eq $true -and
+        -not [string]::IsNullOrWhiteSpace([string] $Record.operationId) -and
+        $hasPositiveDuration -and
+        $hasExpectedName
+    )
 }
 
 function Get-DependencyTelemetryEvidence {
@@ -109,7 +208,7 @@ function Get-DependencyTelemetryEvidence {
         [Parameter(Mandatory)]
         [string] $RenderHostName,
 
-        [TimeSpan] $Timeout = [TimeSpan]::FromMinutes(1)
+        [TimeSpan] $Timeout = [TimeSpan]::FromMinutes(5)
     )
 
     $stopwatch = [System.Diagnostics.Stopwatch]::StartNew()
@@ -133,7 +232,15 @@ function Get-DependencyTelemetryEvidence {
             break
         }
 
-        if (@($records | Where-Object success -EQ $true).Count -gt 0) {
+        $qualifyingRecords = @(
+            $records |
+                Where-Object {
+                    Test-RenderDependencyEvidenceRecord `
+                        -Record $_ `
+                        -RenderHostName $RenderHostName
+                }
+        )
+        if ($qualifyingRecords.Count -gt 0) {
             return [ordered]@{
                 status = 'available'
                 queryStartUtc = $StartTime.ToString('o')
@@ -153,7 +260,7 @@ function Get-DependencyTelemetryEvidence {
         'No Render-target dependency records were available for the validator time window.'
     }
     else {
-        'Render-target dependency records were available, but none recorded a successful Function-to-Render call.'
+        'Render-related dependency records were available, but none proved an exact successful and correlated Function-to-Render call.'
     }
 
     return [ordered]@{
@@ -165,14 +272,15 @@ function Get-DependencyTelemetryEvidence {
         records = @($records)
         reason = $reason
         sourceAssessment =
-            'The deployed Function package does not establish ' +
-            'worker-originated Application Insights dependency collection.'
+            'No exact successful and correlated Render-target worker ' +
+            'dependency was observed within the bounded telemetry polling window.'
         risk =
-            'Application Insights cannot independently prove the deployed ' +
-            'worker dependency path or correlate rejected ingress requests.'
+            'Application Insights cannot correlate a successful Function ' +
+            'invocation with its outbound Render dependency for the validation window.'
         recovery =
-            'Establish worker-originated dependency collection in a separately ' +
-            'approved Function package, then rerun this bounded query.'
+            'Verify that the deployed Function package includes worker ' +
+            'dependency collection, allow for telemetry ingestion, and rerun ' +
+            'this bounded query.'
     }
 }
 

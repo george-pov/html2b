@@ -456,7 +456,7 @@ function Invoke-RenderAuthorizationMatrix {
         }
         $parameters = $null
         $bearerToken = $null
-        $WrongAudienceToken = $null
+        Remove-Variable -Name WrongAudienceToken -Force
     }
 
     if ($null -eq $WrongPrincipalToken) {

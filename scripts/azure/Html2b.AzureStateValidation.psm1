@@ -230,6 +230,29 @@ function Get-RenderContainerAppState {
         -Operation 'read Render Container App state'
 }
 
+function Get-RenderAuthenticationProjection {
+    return @(
+        '{',
+        'platformEnabled:platform.enabled,',
+        'unauthenticatedClientAction:globalValidation.unauthenticatedClientAction,',
+        'excludedPaths:globalValidation.excludedPaths,',
+        'redirectToProvider:globalValidation.redirectToProvider,',
+        'requireHttps:httpSettings.requireHttps,',
+        'azureActiveDirectoryEnabled:identityProviders.azureActiveDirectory.enabled,',
+        'clientId:identityProviders.azureActiveDirectory.registration.clientId,',
+        'openIdIssuer:identityProviders.azureActiveDirectory.registration.openIdIssuer,',
+        'clientSecretSettingName:identityProviders.azureActiveDirectory.registration.clientSecretSettingName,',
+        'allowedAudiences:identityProviders.azureActiveDirectory.validation.allowedAudiences,',
+        'allowedApplications:identityProviders.azureActiveDirectory.validation.defaultAuthorizationPolicy.allowedApplications,',
+        'allowedPrincipalIdentities:identityProviders.azureActiveDirectory.validation.defaultAuthorizationPolicy.allowedPrincipals.identities,',
+        'allowedPrincipalGroups:identityProviders.azureActiveDirectory.validation.defaultAuthorizationPolicy.allowedPrincipals.groups,',
+        'tokenStoreEnabled:login.tokenStore.enabled,',
+        'tokenStoreBlobSettingName:login.tokenStore.azureBlobStorage.sasUrlSettingName,',
+        'tokenStoreFileDirectory:login.tokenStore.fileSystem.directory',
+        '}'
+    ) -join ''
+}
+
 function Get-RenderAuthenticationState {
     param(
         [Parameter(Mandatory)]
@@ -242,26 +265,7 @@ function Get-RenderAuthenticationState {
         [string] $AppName
     )
 
-    $authProjection = @'
-{
-    platformEnabled: platform.enabled,
-    unauthenticatedClientAction: globalValidation.unauthenticatedClientAction,
-    excludedPaths: globalValidation.excludedPaths,
-    redirectToProvider: globalValidation.redirectToProvider,
-    requireHttps: httpSettings.requireHttps,
-    azureActiveDirectoryEnabled: identityProviders.azureActiveDirectory.enabled,
-    clientId: identityProviders.azureActiveDirectory.registration.clientId,
-    openIdIssuer: identityProviders.azureActiveDirectory.registration.openIdIssuer,
-    clientSecretSettingName: identityProviders.azureActiveDirectory.registration.clientSecretSettingName,
-    allowedAudiences: identityProviders.azureActiveDirectory.validation.allowedAudiences,
-    allowedApplications: identityProviders.azureActiveDirectory.validation.defaultAuthorizationPolicy.allowedApplications,
-    allowedPrincipalIdentities: identityProviders.azureActiveDirectory.validation.defaultAuthorizationPolicy.allowedPrincipals.identities,
-    allowedPrincipalGroups: identityProviders.azureActiveDirectory.validation.defaultAuthorizationPolicy.allowedPrincipals.groups,
-    tokenStoreEnabled: login.tokenStore.enabled,
-    tokenStoreBlobSettingName: login.tokenStore.azureBlobStorage.sasUrlSettingName,
-    tokenStoreFileDirectory: login.tokenStore.fileSystem.directory
-}
-'@
+    $authProjection = Get-RenderAuthenticationProjection
     $json = Invoke-AzureCli `
         -Subscription $Subscription `
         -Operation 'read Render authentication configuration' `

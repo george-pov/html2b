@@ -16,6 +16,9 @@ Import-Module `
     (Join-Path $azureScripts 'Html2b.HttpValidation.psm1') `
     -Force
 Import-Module `
+    (Join-Path $azureScripts 'Html2b.TelemetryEvidence.psm1') `
+    -Force
+Import-Module `
     (Join-Path $azureScripts 'Html2b.AzureDevValidation.psm1') `
     -Force
 
@@ -108,6 +111,19 @@ Assert-Equal `
     $missingOrchestrationCommands.Count `
     0 `
     'Azure validation module has unresolved orchestration dependencies.'
+
+$azureStateValidationModule = Get-Module Html2b.AzureStateValidation
+$authProjection = & $azureStateValidationModule {
+    Get-RenderAuthenticationProjection
+}
+Assert-Equal `
+    ($authProjection -match '[\r\n]') `
+    $false `
+    'Render authentication projection contains a Windows-unsafe line break.'
+Assert-Equal `
+    ($authProjection.StartsWith('{') -and $authProjection.EndsWith('}')) `
+    $true `
+    'Render authentication projection is not one JMESPath object.'
 
 $pngBytes = [byte[]]::new(24)
 [byte[]] $pngSignature = @(
@@ -232,6 +248,256 @@ Assert-Equal `
     @($authorizationCases | Where-Object { $_.Contains('bearerToken') }).Count `
     0 `
     'Authorization matrix definition exposed a bearer token.'
+
+if ($null -eq ('Html2b.Tests.AlwaysUnauthorizedHandler' -as [type])) {
+    Add-Type -TypeDefinition @'
+namespace Html2b.Tests;
+
+using System.Net;
+using System.Net.Http;
+using System.Threading;
+using System.Threading.Tasks;
+
+public sealed class AlwaysUnauthorizedHandler : HttpMessageHandler
+{
+    protected override Task<HttpResponseMessage> SendAsync(
+        HttpRequestMessage request,
+        CancellationToken cancellationToken)
+    {
+        return Task.FromResult(
+            new HttpResponseMessage(HttpStatusCode.Unauthorized));
+    }
+}
+'@
+}
+
+$authorizationClient = [System.Net.Http.HttpClient]::new(
+    [Html2b.Tests.AlwaysUnauthorizedHandler]::new())
+try {
+    $authorizationResults = @(
+        Invoke-RenderAuthorizationMatrix `
+            -Client $authorizationClient `
+            -BaseUri ([uri] 'https://render.example/') `
+            -WrongAudienceToken 'not-a-real-token' `
+            -WrongPrincipalToken $null `
+            -AllowedPrincipalId $principalId
+    )
+}
+finally {
+    $authorizationClient.Dispose()
+}
+Assert-Equal `
+    $authorizationResults.Count `
+    6 `
+    'Authorization matrix did not complete after sensitive-value cleanup.'
+Assert-Equal `
+    @($authorizationResults | Where-Object status -EQ 'skipped').Count `
+    1 `
+    'Authorization matrix did not retain the safe wrong-principal skip.'
+
+$telemetryModule = Get-Module Html2b.TelemetryEvidence
+$telemetryStart = [DateTimeOffset] '2026-07-27T22:00:00Z'
+$telemetryEnd = [DateTimeOffset] '2026-07-27T22:05:00Z'
+$telemetryQuery = & $telemetryModule {
+    param($StartTime, $EndTime)
+
+    New-SanitizedDependencyAnalyticsQuery `
+        -StartTime $StartTime `
+        -EndTime $EndTime `
+        -RenderHostName 'render.example'
+} $telemetryStart $telemetryEnd
+Assert-Equal `
+    ($telemetryQuery -match '[\r\n]') `
+    $false `
+    'Dependency telemetry query contains a Windows-unsafe line break.'
+
+$telemetryColumns = @(
+    'timestamp',
+    'name',
+    'type',
+    'target',
+    'resultCode',
+    'success',
+    'duration',
+    'operationId'
+)
+$telemetryRow = [object[]] @(
+    '2026-07-27T22:01:00Z',
+    'POST /internal/renders',
+    'Http',
+    'render.example',
+    '200',
+    $true,
+    '00:00:00.1000000',
+    'operation-id'
+)
+$telemetryResponse = [pscustomobject] @{
+    tables = @(
+        [pscustomobject] @{
+            name = 'PrimaryResult'
+            columns = @(
+                $telemetryColumns |
+                    ForEach-Object {
+                        [pscustomobject] @{
+                            name = $_
+                            type = 'string'
+                        }
+                    }
+            )
+            rows = @(, $telemetryRow)
+        }
+    )
+}
+$telemetryRecords = @(
+    & $telemetryModule {
+        param($Response)
+
+        ConvertFrom-SanitizedDependencyQueryResponse -Response $Response
+    } $telemetryResponse
+)
+Assert-Equal $telemetryRecords.Count 1 'Dependency telemetry row count mismatch.'
+Assert-Equal `
+    $telemetryRecords[0].target `
+    'render.example' `
+    'Dependency telemetry target mapping mismatch.'
+
+$dependencyQualificationCases = @(
+    [pscustomobject]@{
+        name = 'POST /internal/renders'
+        type = 'Http'
+        target = 'RENDER.EXAMPLE'
+        resultCode = '200'
+        success = $true
+        duration = '00:00:00.1000000'
+        operationId = 'operation-id'
+        expected = $true
+        label = 'exact successful dependency'
+    },
+    [pscustomobject]@{
+        name = 'POST /internal/renders'
+        type = 'Http'
+        target = 'other.example'
+        resultCode = '200'
+        success = $true
+        duration = '00:00:00.1000000'
+        operationId = 'operation-id'
+        expected = $false
+        label = 'wrong target'
+    },
+    [pscustomobject]@{
+        name = 'POST /internal/renders'
+        type = 'Http'
+        target = 'render.example'
+        resultCode = '200'
+        success = $false
+        duration = '00:00:00.1000000'
+        operationId = 'operation-id'
+        expected = $false
+        label = 'failed dependency'
+    },
+    [pscustomobject]@{
+        name = 'POST /internal/renders'
+        type = 'Http'
+        target = 'render.example'
+        resultCode = '202'
+        success = $true
+        duration = '00:00:00.1000000'
+        operationId = 'operation-id'
+        expected = $false
+        label = 'non-200 dependency'
+    },
+    [pscustomobject]@{
+        name = 'POST /internal/renders'
+        type = 'Http'
+        target = 'render.example'
+        resultCode = '200'
+        success = $true
+        duration = '00:00:00.1000000'
+        operationId = ' '
+        expected = $false
+        label = 'uncorrelated dependency'
+    },
+    [pscustomobject]@{
+        name = 'POST /internal/renders'
+        type = 'Http'
+        target = 'render.example'
+        resultCode = '200'
+        success = $true
+        duration = '00:00:00'
+        operationId = 'operation-id'
+        expected = $false
+        label = 'zero-duration dependency'
+    },
+    [pscustomobject]@{
+        name = 'GET /unrelated'
+        type = 'Http'
+        target = 'render.example'
+        resultCode = '200'
+        success = $true
+        duration = '00:00:00.1000000'
+        operationId = 'operation-id'
+        expected = $false
+        label = 'unexpected Render route'
+    }
+)
+foreach ($case in $dependencyQualificationCases) {
+    $isQualifyingDependency = & $telemetryModule {
+        param($Record)
+
+        Test-RenderDependencyEvidenceRecord `
+            -Record $Record `
+            -RenderHostName 'render.example'
+    } $case
+    Assert-Equal `
+        $isQualifyingDependency `
+        $case.expected `
+        "Dependency telemetry qualification mismatch for $($case.label)."
+}
+
+$emptyTelemetryResponse = [pscustomobject] @{
+    tables = @(
+        [pscustomobject] @{
+            name = 'PrimaryResult'
+            columns = @($telemetryResponse.tables[0].columns)
+            rows = @()
+        }
+    )
+}
+$emptyTelemetryRecords = @(
+    & $telemetryModule {
+        param($Response)
+
+        ConvertFrom-SanitizedDependencyQueryResponse -Response $Response
+    } $emptyTelemetryResponse
+)
+Assert-Equal `
+    $emptyTelemetryRecords.Count `
+    0 `
+    'Dependency telemetry zero-row response was not preserved.'
+
+$malformedTelemetryResponse = [pscustomobject] @{
+    tables = @(
+        [pscustomobject] @{
+            name = 'PrimaryResult'
+            columns = @(
+                $telemetryResponse.tables[0].columns |
+                    Select-Object -First 7
+            )
+            rows = @()
+        }
+    )
+}
+Assert-Throws `
+    -Action {
+        & $telemetryModule {
+            param($Response)
+
+            ConvertFrom-SanitizedDependencyQueryResponse -Response $Response
+        } $malformedTelemetryResponse
+    } `
+    -ExpectedMessage `
+        'The sanitized dependency query returned an unexpected schema.' `
+    -Message 'Dependency telemetry accepted a malformed schema.'
 
 $telemetryGap = [pscustomobject]@{
     status = 'not-observed'
