@@ -88,7 +88,9 @@ function ConvertFrom-SanitizedDependencyQueryResponse {
             else {
                 [bool] $row[5]
             }
-            duration = [string] $row[6]
+            duration = [Convert]::ToString(
+                $row[6],
+                [System.Globalization.CultureInfo]::InvariantCulture)
             operationId = [string] $row[7]
         }
     }
@@ -147,6 +149,37 @@ function Get-SanitizedDependencyTelemetry {
     return ConvertFrom-SanitizedDependencyQueryResponse -Response $response
 }
 
+function Test-PositiveDependencyDuration {
+    param(
+        [AllowNull()]
+        [object] $Duration
+    )
+
+    $durationText = [Convert]::ToString(
+        $Duration,
+        [System.Globalization.CultureInfo]::InvariantCulture)
+    [double] $durationMilliseconds = 0
+    if ([double]::TryParse(
+            $durationText,
+            [System.Globalization.NumberStyles]::Float,
+            [System.Globalization.CultureInfo]::InvariantCulture,
+            [ref] $durationMilliseconds)) {
+        return (
+            [double]::IsFinite($durationMilliseconds) -and
+            $durationMilliseconds -gt 0
+        )
+    }
+
+    [TimeSpan] $durationTimeSpan = [TimeSpan]::Zero
+    return (
+        [TimeSpan]::TryParse(
+            $durationText,
+            [System.Globalization.CultureInfo]::InvariantCulture,
+            [ref] $durationTimeSpan) -and
+        $durationTimeSpan -gt [TimeSpan]::Zero
+    )
+}
+
 function Test-RenderDependencyEvidenceRecord {
     param(
         [Parameter(Mandatory)]
@@ -156,11 +189,8 @@ function Test-RenderDependencyEvidenceRecord {
         [string] $RenderHostName
     )
 
-    [TimeSpan] $duration = [TimeSpan]::Zero
-    $hasPositiveDuration = [TimeSpan]::TryParse(
-        [string] $Record.duration,
-        [System.Globalization.CultureInfo]::InvariantCulture,
-        [ref] $duration) -and $duration -gt [TimeSpan]::Zero
+    $hasPositiveDuration = Test-PositiveDependencyDuration `
+        -Duration $Record.duration
     $hasExpectedName =
         [string]::Equals(
             [string] $Record.name,

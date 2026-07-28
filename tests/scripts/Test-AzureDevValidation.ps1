@@ -375,6 +375,17 @@ $dependencyQualificationCases = @(
     },
     [pscustomobject]@{
         name = 'POST /internal/renders'
+        type = 'HTTP'
+        target = 'render.example'
+        resultCode = '200'
+        success = $true
+        duration = '258.0421'
+        operationId = 'operation-id'
+        expected = $true
+        label = 'numeric millisecond duration'
+    },
+    [pscustomobject]@{
+        name = 'POST /internal/renders'
         type = 'Http'
         target = 'other.example'
         resultCode = '200'
@@ -423,7 +434,7 @@ $dependencyQualificationCases = @(
         target = 'render.example'
         resultCode = '200'
         success = $true
-        duration = '00:00:00'
+        duration = '0'
         operationId = 'operation-id'
         expected = $false
         label = 'zero-duration dependency'
