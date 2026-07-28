@@ -94,7 +94,9 @@ resource applicationInsights 'Microsoft.Insights/components@2020-02-02' = {
 resource functionApp 'Microsoft.Web/sites@2024-04-01' = {
   name: functionAppName
   location: location
-  tags: functionTags
+  tags: union(functionTags, {
+    'hidden-link: /app-insights-resource-id': applicationInsights.id
+  })
   kind: 'functionapp,linux'
   identity: {
     type: 'SystemAssigned'
