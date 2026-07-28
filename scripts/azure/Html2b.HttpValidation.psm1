@@ -42,18 +42,28 @@ function Wait-EndpointStatus {
         [Parameter(Mandatory)]
         [string] $ExpectedBodyStatus,
 
-        [TimeSpan] $Timeout = [TimeSpan]::FromMinutes(4)
+        [TimeSpan] $Timeout = [TimeSpan]::FromMinutes(4),
+
+        [AllowNull()]
+        [System.Net.Http.HttpClient] $Client
     )
 
-    $client = New-ValidationHttpClient
-    $client.Timeout = [TimeSpan]::FromSeconds(20)
+    $ownsClient = $null -eq $Client
+    if ($ownsClient) {
+        $Client = New-ValidationHttpClient
+    }
     $stopwatch = [System.Diagnostics.Stopwatch]::StartNew()
     $lastStatus = $null
 
     try {
         while ($stopwatch.Elapsed -lt $Timeout) {
+            $requestCancellation =
+                [System.Threading.CancellationTokenSource]::new(
+                    [TimeSpan]::FromSeconds(20))
             try {
-                $response = $client.GetAsync($Uri).GetAwaiter().GetResult()
+                $response = $Client.GetAsync(
+                    $Uri,
+                    $requestCancellation.Token).GetAwaiter().GetResult()
                 try {
                     $lastStatus = [int] $response.StatusCode
                     if ($lastStatus -eq 200) {
@@ -84,12 +94,17 @@ function Wait-EndpointStatus {
             catch [System.Threading.Tasks.TaskCanceledException] {
                 $lastStatus = $null
             }
+            finally {
+                $requestCancellation.Dispose()
+            }
 
             Start-Sleep -Seconds 3
         }
     }
     finally {
-        $client.Dispose()
+        if ($ownsClient) {
+            $Client.Dispose()
+        }
     }
 
     throw "Timed out waiting for $($Uri.AbsolutePath); last status was $lastStatus."
@@ -253,16 +268,20 @@ function Invoke-FunctionContractValidation {
         [Parameter(Mandatory)]
         [uri] $BaseUri,
 
-        [string] $Phase = 'warm'
+        [string] $Phase = 'warm',
+
+        [switch] $SkipLiveness
     )
 
     $results = @()
-    $results += Invoke-HealthContract `
-        -Client $Client `
-        -Uri ([uri]::new($BaseUri, 'health/live')) `
-        -ExpectedBodyStatus 'live' `
-        -Phase $Phase `
-        -HostLabel 'Function'
+    if (-not $SkipLiveness) {
+        $results += Invoke-HealthContract `
+            -Client $Client `
+            -Uri ([uri]::new($BaseUri, 'health/live')) `
+            -ExpectedBodyStatus 'live' `
+            -Phase $Phase `
+            -HostLabel 'Function'
+    }
     $results += Invoke-HealthContract `
         -Client $Client `
         -Uri ([uri]::new($BaseUri, 'health/ready')) `
@@ -279,6 +298,52 @@ function Invoke-FunctionContractValidation {
     }
 
     return $results
+}
+
+function Invoke-ExpectedFunctionAuthorizationRejection {
+    param(
+        [Parameter(Mandatory)]
+        [System.Net.Http.HttpClient] $Client,
+
+        [Parameter(Mandatory)]
+        [uri] $Uri,
+
+        [Parameter(Mandatory)]
+        [ValidateSet('GET', 'POST')]
+        [string] $Method,
+
+        [Parameter(Mandatory)]
+        [string] $Scenario
+    )
+
+    $request = [System.Net.Http.HttpRequestMessage]::new(
+        [System.Net.Http.HttpMethod]::new($Method),
+        $Uri)
+    [System.Net.Http.HttpResponseMessage] $response = $null
+    try {
+        $response = $Client.SendAsync($request).GetAwaiter().GetResult()
+        $httpStatus = [int] $response.StatusCode
+        if ($httpStatus -ne 401) {
+            throw "Function $Scenario returned HTTP $httpStatus instead of 401."
+        }
+
+        return [ordered]@{
+            host = 'Function'
+            phase = 'protected-p03'
+            method = $Method
+            path = $Uri.AbsolutePath
+            scenario = $Scenario
+            expectedHttpStatus = 401
+            httpStatus = $httpStatus
+            status = 'passed'
+        }
+    }
+    finally {
+        if ($null -ne $response) {
+            $response.Dispose()
+        }
+        $request.Dispose()
+    }
 }
 
 function Invoke-ExpectedRenderAuthorizationStatus {
@@ -551,6 +616,7 @@ function Get-WrongAudienceAccessToken {
 Export-ModuleMember -Function @(
     'Get-RenderAuthorizationTestCases',
     'Get-WrongAudienceAccessToken',
+    'Invoke-ExpectedFunctionAuthorizationRejection',
     'Invoke-FunctionContractValidation',
     'Invoke-HealthContract',
     'Invoke-RenderAuthorizationMatrix',

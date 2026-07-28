@@ -314,5 +314,312 @@ function Get-DependencyTelemetryEvidence {
     }
 }
 
+function Resolve-FunctionAuthorizationTelemetryEvidence {
+    param(
+        [Parameter(Mandatory)]
+        [AllowEmptyCollection()]
+        [object[]] $NoKeyRecords,
 
-Export-ModuleMember -Function 'Get-DependencyTelemetryEvidence'
+        [Parameter(Mandatory)]
+        [AllowEmptyCollection()]
+        [object[]] $KeyedRecords,
+
+        [Parameter(Mandatory)]
+        [DateTimeOffset] $NoKeyStartTime,
+
+        [Parameter(Mandatory)]
+        [DateTimeOffset] $NoKeyEndTime,
+
+        [Parameter(Mandatory)]
+        [DateTimeOffset] $KeyedStartTime,
+
+        [Parameter(Mandatory)]
+        [DateTimeOffset] $KeyedEndTime,
+
+        [Parameter(Mandatory)]
+        [string] $RenderHostName
+    )
+
+    if ($NoKeyRecords.Count -ne 0) {
+        throw 'No-key Function validation produced a Render dependency.'
+    }
+
+    $qualifyingKeyedRecords = @(
+        $KeyedRecords |
+            Where-Object {
+                Test-RenderDependencyEvidenceRecord `
+                    -Record $_ `
+                    -RenderHostName $RenderHostName
+            }
+    )
+    $readinessDependencyCount = @(
+        $qualifyingKeyedRecords |
+            Where-Object {
+                [string]::Equals(
+                    [string] $_.name,
+                    'GET /health/ready',
+                    [StringComparison]::OrdinalIgnoreCase)
+            }
+    ).Count
+    $renderDependencyCount = @(
+        $qualifyingKeyedRecords |
+            Where-Object {
+                [string]::Equals(
+                    [string] $_.name,
+                    'POST /internal/renders',
+                    [StringComparison]::OrdinalIgnoreCase)
+            }
+    ).Count
+
+    if ($readinessDependencyCount -eq 0 -or
+        $renderDependencyCount -eq 0) {
+        return [ordered]@{
+            status = 'not-observed'
+            classification = 'evidence-gap'
+            reason =
+                'The keyed telemetry window did not contain both an exact ' +
+                'successful readiness dependency and an exact successful ' +
+                'render dependency.'
+            risk =
+                'Application Insights cannot prove both keyed readiness and ' +
+                'keyed rendering through the Function-to-Render boundary.'
+            recovery =
+                'Verify the deployed Function dependency collector, allow ' +
+                'for telemetry ingestion, and rerun this bounded query.'
+            noKey = [ordered]@{
+                status = 'passed'
+                queryStartUtc = $NoKeyStartTime.ToString('o')
+                queryEndUtc = $NoKeyEndTime.ToString('o')
+                recordCount = 0
+            }
+            keyed = [ordered]@{
+                status = 'not-observed'
+                queryStartUtc = $KeyedStartTime.ToString('o')
+                queryEndUtc = $KeyedEndTime.ToString('o')
+                recordCount = $KeyedRecords.Count
+                records = @($KeyedRecords)
+            }
+        }
+    }
+
+    return [ordered]@{
+        status = 'available'
+        recordCount = $KeyedRecords.Count
+        records = @($KeyedRecords)
+        noKey = [ordered]@{
+            status = 'passed'
+            queryStartUtc = $NoKeyStartTime.ToString('o')
+            queryEndUtc = $NoKeyEndTime.ToString('o')
+            recordCount = 0
+        }
+        keyed = [ordered]@{
+            status = 'available'
+            queryStartUtc = $KeyedStartTime.ToString('o')
+            queryEndUtc = $KeyedEndTime.ToString('o')
+            recordCount = $KeyedRecords.Count
+            records = @($KeyedRecords)
+            readinessDependencyCount = $readinessDependencyCount
+            renderDependencyCount = $renderDependencyCount
+        }
+    }
+}
+
+function Get-FunctionAuthorizationTelemetryEvidence {
+    param(
+        [Parameter(Mandatory)]
+        [string] $Subscription,
+
+        [Parameter(Mandatory)]
+        [string] $GroupName,
+
+        [Parameter(Mandatory)]
+        [string] $ApplicationName,
+
+        [Parameter(Mandatory)]
+        [DateTimeOffset] $NoKeyStartTime,
+
+        [Parameter(Mandatory)]
+        [DateTimeOffset] $NoKeyEndTime,
+
+        [Parameter(Mandatory)]
+        [DateTimeOffset] $KeyedStartTime,
+
+        [Parameter(Mandatory)]
+        [DateTimeOffset] $KeyedEndTime,
+
+        [Parameter(Mandatory)]
+        [string] $RenderHostName,
+
+        [TimeSpan] $Timeout = [TimeSpan]::FromMinutes(5)
+    )
+
+    if ($NoKeyStartTime -gt $NoKeyEndTime -or
+        $KeyedStartTime -gt $KeyedEndTime -or
+        $NoKeyEndTime -ge $KeyedStartTime) {
+        throw 'Function authorization telemetry windows are invalid.'
+    }
+
+    $stopwatch = [System.Diagnostics.Stopwatch]::StartNew()
+    $pollIntervalMilliseconds = [Math]::Min(
+        10000.0,
+        [Math]::Max(1.0, $Timeout.TotalMilliseconds / 4.0))
+    $noKeyRecords = @()
+    $noKeyQueryFailure = $null
+    $keyedRecords = @()
+    $qualifyingKeyedRecords = @()
+    $keyedQueryFailure = $null
+    $hasReadinessDependency = $false
+    $hasRenderDependency = $false
+    while ($true) {
+        try {
+            $noKeyRecords = @(
+                Get-SanitizedDependencyTelemetry `
+                    -Subscription $Subscription `
+                    -GroupName $GroupName `
+                    -ApplicationName $ApplicationName `
+                    -StartTime $NoKeyStartTime `
+                    -EndTime $NoKeyEndTime `
+                    -RenderHostName $RenderHostName
+            )
+            $noKeyQueryFailure = $null
+        }
+        catch {
+            $noKeyQueryFailure = $_.Exception.Message
+        }
+        if ($noKeyRecords.Count -ne 0) {
+            throw 'No-key Function validation produced a Render dependency.'
+        }
+
+        try {
+            $keyedRecords = @(
+                Get-SanitizedDependencyTelemetry `
+                    -Subscription $Subscription `
+                    -GroupName $GroupName `
+                    -ApplicationName $ApplicationName `
+                    -StartTime $KeyedStartTime `
+                    -EndTime $KeyedEndTime `
+                    -RenderHostName $RenderHostName
+            )
+            $keyedQueryFailure = $null
+            $qualifyingKeyedRecords = @(
+                $keyedRecords |
+                    Where-Object {
+                        Test-RenderDependencyEvidenceRecord `
+                            -Record $_ `
+                            -RenderHostName $RenderHostName
+                    }
+            )
+            $hasReadinessDependency = @(
+                $qualifyingKeyedRecords |
+                    Where-Object {
+                        [string]::Equals(
+                            [string] $_.name,
+                            'GET /health/ready',
+                            [StringComparison]::OrdinalIgnoreCase)
+                    }
+            ).Count -gt 0
+            $hasRenderDependency = @(
+                $qualifyingKeyedRecords |
+                    Where-Object {
+                        [string]::Equals(
+                            [string] $_.name,
+                            'POST /internal/renders',
+                            [StringComparison]::OrdinalIgnoreCase)
+                    }
+            ).Count -gt 0
+        }
+        catch {
+            $keyedQueryFailure = $_.Exception.Message
+        }
+
+        $remainingMilliseconds =
+            $Timeout.TotalMilliseconds - $stopwatch.Elapsed.TotalMilliseconds
+        if ($remainingMilliseconds -le 0) {
+            break
+        }
+
+        $sleepMilliseconds = [int] [Math]::Ceiling(
+            [Math]::Min(
+                $pollIntervalMilliseconds,
+                $remainingMilliseconds))
+        Start-Sleep -Milliseconds $sleepMilliseconds
+    }
+
+    if ($null -ne $noKeyQueryFailure) {
+        return [ordered]@{
+            status = 'not-observed'
+            classification = 'evidence-gap'
+            reason =
+                'The sanitized no-key dependency query failed: ' +
+                $noKeyQueryFailure
+            risk =
+                'Telemetry cannot independently prove that rejected no-key ' +
+                'requests created no Render dependency.'
+            recovery =
+                'Restore the bounded telemetry query and rerun the complete ' +
+                'Function authorization matrix.'
+            noKey = [ordered]@{
+                status = 'not-observed'
+                queryStartUtc = $NoKeyStartTime.ToString('o')
+                queryEndUtc = $NoKeyEndTime.ToString('o')
+            }
+            keyed = [ordered]@{
+                status = if ($hasReadinessDependency -and
+                    $hasRenderDependency) {
+                    'available'
+                }
+                else {
+                    'not-observed'
+                }
+                queryStartUtc = $KeyedStartTime.ToString('o')
+                queryEndUtc = $KeyedEndTime.ToString('o')
+                recordCount = $keyedRecords.Count
+                records = @($keyedRecords)
+            }
+        }
+    }
+
+    if ($null -ne $keyedQueryFailure) {
+        return [ordered]@{
+            status = 'not-observed'
+            classification = 'evidence-gap'
+            reason =
+                'The sanitized keyed dependency query failed: ' +
+                $keyedQueryFailure
+            risk =
+                'Application Insights cannot prove both keyed readiness and ' +
+                'keyed rendering through the Function-to-Render boundary.'
+            recovery =
+                'Verify the deployed Function dependency collector, allow ' +
+                'for telemetry ingestion, and rerun this bounded query.'
+            noKey = [ordered]@{
+                status = 'passed'
+                queryStartUtc = $NoKeyStartTime.ToString('o')
+                queryEndUtc = $NoKeyEndTime.ToString('o')
+                recordCount = 0
+            }
+            keyed = [ordered]@{
+                status = 'not-observed'
+                queryStartUtc = $KeyedStartTime.ToString('o')
+                queryEndUtc = $KeyedEndTime.ToString('o')
+                recordCount = $keyedRecords.Count
+                records = @($keyedRecords)
+            }
+        }
+    }
+
+    return Resolve-FunctionAuthorizationTelemetryEvidence `
+        -NoKeyRecords @($noKeyRecords) `
+        -KeyedRecords @($keyedRecords) `
+        -NoKeyStartTime $NoKeyStartTime `
+        -NoKeyEndTime $NoKeyEndTime `
+        -KeyedStartTime $KeyedStartTime `
+        -KeyedEndTime $KeyedEndTime `
+        -RenderHostName $RenderHostName
+}
+
+
+Export-ModuleMember -Function @(
+    'Get-DependencyTelemetryEvidence',
+    'Get-FunctionAuthorizationTelemetryEvidence'
+)

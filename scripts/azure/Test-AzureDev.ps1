@@ -28,6 +28,9 @@ param(
     [ValidateNotNullOrEmpty()]
     [string] $ApplicationInsightsName = 'appi-html2b-dev',
 
+    [ValidateSet('default')]
+    [string] $FunctionHostKeyName = 'default',
+
     [AllowNull()]
     [System.Security.SecureString] $WrongPrincipalRenderToken
 )

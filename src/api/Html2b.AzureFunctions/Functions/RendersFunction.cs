@@ -12,7 +12,7 @@ public sealed class RendersFunction(IPocRenderGateway renderGateway)
     [Function("RenderPoc")]
     public async Task<IActionResult> PostAsync(
         [HttpTrigger(
-            AuthorizationLevel.Anonymous,
+            AuthorizationLevel.Function,
             "post",
             Route = "api/renders/{format}")]
         HttpRequest request,

@@ -6,13 +6,17 @@ if ($PSVersionTable.PSVersion -lt [version] '7.3') {
 }
 
 Import-Module `
-    (Join-Path $PSScriptRoot 'Html2b.AzureStateValidation.psm1')
+    (Join-Path $PSScriptRoot 'Html2b.AzureStateValidation.psm1') `
+    -Force
 Import-Module `
-    (Join-Path $PSScriptRoot 'Html2b.HttpValidation.psm1')
+    (Join-Path $PSScriptRoot 'Html2b.HttpValidation.psm1') `
+    -Force
 Import-Module `
-    (Join-Path $PSScriptRoot 'Html2b.TelemetryEvidence.psm1')
+    (Join-Path $PSScriptRoot 'Html2b.TelemetryEvidence.psm1') `
+    -Force
 
 $script:RenderIdentityName = 'id-html2b-render-dev'
+$script:FunctionTelemetryClockSkewGuard = [TimeSpan]::FromSeconds(30)
 
 function Get-ExpectedRenderIdentityId {
     param(
@@ -109,6 +113,349 @@ function Resolve-AzureDevValidationOutcome {
     }
 }
 
+function Get-ExistingDefaultFunctionHostKey {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]
+        [string] $Subscription,
+
+        [Parameter(Mandatory)]
+        [string] $GroupName,
+
+        [Parameter(Mandatory)]
+        [string] $AppName
+    )
+
+    $functionHostKeyOutput = $null
+    $functionHostKey = $null
+    try {
+        try {
+            $functionHostKeyOutput = & az functionapp keys list `
+                --subscription $Subscription `
+                --resource-group $GroupName `
+                --name $AppName `
+                --query 'functionKeys.default' `
+                --output tsv `
+                --only-show-errors `
+                2>$null 3>$null 4>$null 5>$null 6>$null
+        }
+        catch {
+            throw 'Unable to read the existing default Function host key.'
+        }
+
+        if ($LASTEXITCODE -ne 0) {
+            throw 'Unable to read the existing default Function host key.'
+        }
+
+        $functionHostKey =
+            ($functionHostKeyOutput | Out-String).Trim()
+        if ([string]::IsNullOrWhiteSpace($functionHostKey)) {
+            throw 'The existing default Function host key is missing.'
+        }
+        if ($functionHostKey -match '\s') {
+            throw 'The existing default Function host key is invalid.'
+        }
+
+        return $functionHostKey
+    }
+    finally {
+        $functionHostKey = $null
+        $functionHostKeyOutput = $null
+    }
+}
+
+function Test-ExistingDefaultFunctionHostKey {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]
+        [string] $Subscription,
+
+        [Parameter(Mandatory)]
+        [string] $GroupName,
+
+        [Parameter(Mandatory)]
+        [string] $AppName
+    )
+
+    $functionHostKey = $null
+    try {
+        $functionHostKey = Get-ExistingDefaultFunctionHostKey `
+            -Subscription $Subscription `
+            -GroupName $GroupName `
+            -AppName $AppName
+
+        return [ordered]@{
+            keyName = 'default'
+            status = 'passed'
+        }
+    }
+    finally {
+        $functionHostKey = $null
+    }
+}
+
+function Assert-ExpectedFunctionBaseUri {
+    param(
+        [Parameter(Mandatory)]
+        [uri] $BaseUri,
+
+        [Parameter(Mandatory)]
+        [string] $AppName
+    )
+
+    $expectedHostName = "$AppName.azurewebsites.net"
+    if (-not $BaseUri.IsAbsoluteUri -or
+        -not [string]::Equals(
+            $BaseUri.Scheme,
+            [uri]::UriSchemeHttps,
+            [StringComparison]::OrdinalIgnoreCase) -or
+        -not [string]::Equals(
+            $BaseUri.Host,
+            $expectedHostName,
+            [StringComparison]::OrdinalIgnoreCase) -or
+        $BaseUri.Port -ne 443 -or
+        -not [string]::IsNullOrEmpty($BaseUri.UserInfo) -or
+        $BaseUri.AbsolutePath -cne '/' -or
+        -not [string]::IsNullOrEmpty($BaseUri.Query) -or
+        -not [string]::IsNullOrEmpty($BaseUri.Fragment)) {
+        throw 'Function validation requires the expected HTTPS Function origin.'
+    }
+}
+
+function New-FunctionAuthorizationTelemetryWindows {
+    param(
+        [Parameter(Mandatory)]
+        [DateTimeOffset] $NoKeyStartTime,
+
+        [Parameter(Mandatory)]
+        [DateTimeOffset] $NoKeyEndTime,
+
+        [Parameter(Mandatory)]
+        [DateTimeOffset] $KeyedStartTime,
+
+        [Parameter(Mandatory)]
+        [DateTimeOffset] $KeyedEndTime
+    )
+
+    $noKeyWindow = [ordered]@{
+        startTime =
+            $NoKeyStartTime.Subtract($script:FunctionTelemetryClockSkewGuard)
+        endTime =
+            $NoKeyEndTime.Add($script:FunctionTelemetryClockSkewGuard)
+    }
+    $keyedWindow = [ordered]@{
+        startTime =
+            $KeyedStartTime.Subtract($script:FunctionTelemetryClockSkewGuard)
+        endTime =
+            $KeyedEndTime.Add($script:FunctionTelemetryClockSkewGuard)
+    }
+    if ($noKeyWindow.endTime -ge $keyedWindow.startTime) {
+        throw 'Function authorization telemetry guard windows overlap.'
+    }
+
+    return [ordered]@{
+        clockSkewGuardSeconds =
+            $script:FunctionTelemetryClockSkewGuard.TotalSeconds
+        noKeyWindow = $noKeyWindow
+        keyedWindow = $keyedWindow
+    }
+}
+
+function Invoke-FunctionAuthorizationValidation {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]
+        [string] $Subscription,
+
+        [Parameter(Mandatory)]
+        [string] $GroupName,
+
+        [Parameter(Mandatory)]
+        [string] $AppName,
+
+        [Parameter(Mandatory)]
+        [uri] $BaseUri,
+
+        [Parameter(Mandatory)]
+        [string] $ContainerAppResourceId,
+
+        [Parameter(Mandatory)]
+        [string] $RevisionName,
+
+        [ValidateSet('default')]
+        [string] $FunctionHostKeyName = 'default'
+    )
+
+    Assert-ExpectedFunctionBaseUri -BaseUri $BaseUri -AppName $AppName
+
+    $contracts = @()
+    $waits = @()
+    $functionHostKey = $null
+    [System.Net.Http.HttpClient] $anonymousClient = $null
+    [System.Net.Http.HttpClient] $keyedClient = $null
+    try {
+        $anonymousClient = New-ValidationHttpClient
+        $waits += Wait-EndpointStatus `
+            -Client $anonymousClient `
+            -Uri ([uri]::new($BaseUri, 'health/live')) `
+            -ExpectedBodyStatus 'live'
+
+        $noKeyStartTime = [DateTimeOffset]::UtcNow
+        $contracts += Invoke-HealthContract `
+            -Client $anonymousClient `
+            -Uri ([uri]::new($BaseUri, 'health/live')) `
+            -ExpectedBodyStatus 'live' `
+            -Phase 'anonymous-p03' `
+            -HostLabel 'Function'
+
+        $contracts += Invoke-ExpectedFunctionAuthorizationRejection `
+            -Client $anonymousClient `
+            -Uri ([uri]::new($BaseUri, 'health/ready')) `
+            -Method 'GET' `
+            -Scenario 'ready-without-key'
+        $contracts += Invoke-ExpectedFunctionAuthorizationRejection `
+            -Client $anonymousClient `
+            -Uri ([uri]::new($BaseUri, 'api/renders/png')) `
+            -Method 'POST' `
+            -Scenario 'render-without-key'
+        $noKeyEndTime = [DateTimeOffset]::UtcNow
+
+        $coldReadyScaleSeconds = Wait-RenderScaledToZero `
+            -Subscription $Subscription `
+            -ContainerAppResourceId $ContainerAppResourceId `
+            -RevisionName $RevisionName
+        $earliestKeyedStartTime =
+            $noKeyEndTime.Add($script:FunctionTelemetryClockSkewGuard)
+        $earliestKeyedStartTime =
+            $earliestKeyedStartTime.Add(
+                $script:FunctionTelemetryClockSkewGuard)
+        $earliestKeyedStartTime = $earliestKeyedStartTime.AddTicks(1)
+        while ($true) {
+            $remainingSeparationMilliseconds =
+                ($earliestKeyedStartTime - [DateTimeOffset]::UtcNow).
+                    TotalMilliseconds
+            if ($remainingSeparationMilliseconds -le 0) {
+                break
+            }
+
+            Start-Sleep -Milliseconds (
+                [int] [Math]::Ceiling(
+                    [Math]::Min(1000.0, $remainingSeparationMilliseconds)))
+        }
+        $coldWake = [ordered]@{
+            readinessScaleToZeroSeconds = $coldReadyScaleSeconds
+            readinessElapsedMilliseconds = $null
+            readinessConvergenceMilliseconds = $null
+            pngScaleToZeroSeconds = $null
+            firstReadinessAttemptRetried = $false
+            firstPngAttemptRetried = $false
+        }
+
+        $functionHostKey = Get-ExistingDefaultFunctionHostKey `
+            -Subscription $Subscription `
+            -GroupName $GroupName `
+            -AppName $AppName
+        $keyedClient = New-ValidationHttpClient
+        if (-not $keyedClient.DefaultRequestHeaders.TryAddWithoutValidation(
+                'x-functions-key',
+                $functionHostKey)) {
+            throw 'Unable to configure the approved Function host key.'
+        }
+        $functionHostKey = $null
+
+        $keyedStartTime = [DateTimeOffset]::UtcNow
+        $coldReady = Invoke-HealthContract `
+            -Client $keyedClient `
+            -Uri ([uri]::new($BaseUri, 'health/ready')) `
+            -ExpectedBodyStatus 'ready' `
+            -Phase 'keyed-cold-readiness' `
+            -HostLabel 'Function' `
+            -ReturnFailure
+        $contracts += @($coldReady)
+        $coldWake.readinessElapsedMilliseconds =
+            $coldReady.elapsedMilliseconds
+        $coldReadySucceeded =
+            $coldReady.httpStatus -eq 200 -and
+            $coldReady.bodyStatus -eq 'ready'
+        if (-not $coldReadySucceeded) {
+            if ($coldReady.httpStatus -ne 503 -or
+                $coldReady.bodyStatus -ne 'not-ready') {
+                throw "Cold keyed Function readiness returned unexpected HTTP $($coldReady.httpStatus) with health status '$($coldReady.bodyStatus)' after $($coldReady.elapsedMilliseconds) ms."
+            }
+
+            $coldWake.firstReadinessAttemptRetried = $true
+            $readinessConvergence = Wait-EndpointStatus `
+                -Client $keyedClient `
+                -Uri ([uri]::new($BaseUri, 'health/ready')) `
+                -ExpectedBodyStatus 'ready' `
+                -Timeout ([TimeSpan]::FromSeconds(60))
+            $waits += $readinessConvergence
+            $coldWake.readinessConvergenceMilliseconds =
+                $readinessConvergence.elapsedMilliseconds
+        }
+
+        $contracts += Invoke-HealthContract `
+            -Client $keyedClient `
+            -Uri ([uri]::new($BaseUri, 'health/ready')) `
+            -ExpectedBodyStatus 'ready' `
+            -Phase 'keyed-warm-after-cold-readiness' `
+            -HostLabel 'Function'
+        $contracts += @(
+            Invoke-FunctionContractValidation `
+                -Client $keyedClient `
+                -BaseUri $BaseUri `
+                -Phase 'keyed-warm' `
+                -SkipLiveness
+        )
+
+        $coldPngScaleSeconds = Wait-RenderScaledToZero `
+            -Subscription $Subscription `
+            -ContainerAppResourceId $ContainerAppResourceId `
+            -RevisionName $RevisionName
+        $coldWake.pngScaleToZeroSeconds = $coldPngScaleSeconds
+        $contracts += Invoke-RenderContract `
+            -Client $keyedClient `
+            -Uri ([uri]::new($BaseUri, 'api/renders/png')) `
+            -Format 'png' `
+            -Phase 'keyed-cold-png' `
+            -HostLabel 'Function'
+        $contracts += Invoke-RenderContract `
+            -Client $keyedClient `
+            -Uri ([uri]::new($BaseUri, 'api/renders/png')) `
+            -Format 'png' `
+            -Phase 'keyed-warm-after-cold-png' `
+            -HostLabel 'Function'
+        $keyedEndTime = [DateTimeOffset]::UtcNow
+        $telemetryWindows = New-FunctionAuthorizationTelemetryWindows `
+            -NoKeyStartTime $noKeyStartTime `
+            -NoKeyEndTime $noKeyEndTime `
+            -KeyedStartTime $keyedStartTime `
+            -KeyedEndTime $keyedEndTime
+
+        return [ordered]@{
+            keyName = $FunctionHostKeyName
+            contracts = @($contracts)
+            waits = @($waits)
+            coldWake = $coldWake
+            clockSkewGuardSeconds =
+                $telemetryWindows.clockSkewGuardSeconds
+            noKeyWindow = $telemetryWindows.noKeyWindow
+            keyedWindow = $telemetryWindows.keyedWindow
+        }
+    }
+    finally {
+        $functionHostKey = $null
+        if ($null -ne $keyedClient) {
+            $null = $keyedClient.DefaultRequestHeaders.Remove(
+                'x-functions-key')
+            $keyedClient.Dispose()
+        }
+        if ($null -ne $anonymousClient) {
+            $anonymousClient.Dispose()
+        }
+    }
+}
+
 function Invoke-Html2bAzureDevValidation {
     [CmdletBinding()]
     param(
@@ -140,6 +487,9 @@ function Invoke-Html2bAzureDevValidation {
         [ValidateNotNullOrEmpty()]
         [string] $ApplicationInsightsName = 'appi-html2b-dev',
 
+        [ValidateSet('default')]
+        [string] $FunctionHostKeyName = 'default',
+
         [AllowNull()]
         [System.Security.SecureString] $WrongPrincipalRenderToken
     )
@@ -164,13 +514,14 @@ if (-not (Get-Command az -ErrorAction SilentlyContinue)) {
 
 $repositoryRoot = (Resolve-Path (Join-Path $PSScriptRoot '..\..')).Path
 $outputDirectory =
-    Join-Path $repositoryRoot 'build\validation\005\p02\live'
+    Join-Path $repositoryRoot 'build\validation\005\p03\live'
 $summaryPath = Join-Path $outputDirectory 'validation-summary.json'
 $validation = [ordered]@{
-    phase = 'P02'
+    phase = 'P03'
     status = 'running'
     account = $null
     function = $null
+    functionAuthorization = $null
     render = $null
     renderAuthentication = $null
     revision = $null
@@ -252,67 +603,28 @@ try {
 
     $functionBaseUri = [uri] "https://$($functionState.properties.defaultHostName)/"
     $renderBaseUri = [uri] "$renderUrl/"
-    $liveValidationStartedAt = [DateTimeOffset]::UtcNow
-    $liveValidationEndedAt = $null
-    $validation.waits += Wait-EndpointStatus `
-        -Uri ([uri]::new($functionBaseUri, 'health/live')) `
-        -ExpectedBodyStatus 'live'
+    $functionAuthorization =
+        Invoke-FunctionAuthorizationValidation `
+            -Subscription $canonicalSubscriptionId `
+            -GroupName $ResourceGroupName `
+            -AppName $FunctionAppName `
+            -BaseUri $functionBaseUri `
+            -ContainerAppResourceId $renderState.id `
+            -RevisionName $renderState.properties.latestRevisionName `
+            -FunctionHostKeyName $FunctionHostKeyName
+    $validation.functionAuthorization = [ordered]@{
+        keyName = $functionAuthorization.keyName
+        clockSkewGuardSeconds =
+            $functionAuthorization.clockSkewGuardSeconds
+        noKeyWindow = $functionAuthorization.noKeyWindow
+        keyedWindow = $functionAuthorization.keyedWindow
+    }
+    $validation.waits += @($functionAuthorization.waits)
+    $validation.contracts += @($functionAuthorization.contracts)
+    $validation.coldWake = $functionAuthorization.coldWake
 
     $client = New-ValidationHttpClient
     try {
-        $coldReadyScaleSeconds = Wait-RenderScaledToZero `
-            -Subscription $canonicalSubscriptionId `
-            -ContainerAppResourceId $renderState.id `
-            -RevisionName $renderState.properties.latestRevisionName
-        $validation.coldWake = [ordered]@{
-            readinessScaleToZeroSeconds = $coldReadyScaleSeconds
-            readinessElapsedMilliseconds = $null
-            readinessConvergenceMilliseconds = $null
-            pngScaleToZeroSeconds = $null
-            firstReadinessAttemptRetried = $false
-            firstPngAttemptRetried = $false
-        }
-        $coldReady = Invoke-HealthContract `
-            -Client $client `
-            -Uri ([uri]::new($functionBaseUri, 'health/ready')) `
-            -ExpectedBodyStatus 'ready' `
-            -Phase 'cold-readiness' `
-            -HostLabel 'Function' `
-            -ReturnFailure
-        $validation.contracts += @($coldReady)
-        $validation.coldWake.readinessElapsedMilliseconds =
-            $coldReady.elapsedMilliseconds
-        $coldReadySucceeded =
-            $coldReady.httpStatus -eq 200 -and
-            $coldReady.bodyStatus -eq 'ready'
-        if (-not $coldReadySucceeded) {
-            if ($coldReady.httpStatus -ne 503 -or
-                $coldReady.bodyStatus -ne 'not-ready') {
-                throw "Cold Function readiness returned unexpected HTTP $($coldReady.httpStatus) with health status '$($coldReady.bodyStatus)' after $($coldReady.elapsedMilliseconds) ms."
-            }
-
-            $validation.coldWake.firstReadinessAttemptRetried = $true
-            $readinessConvergence = Wait-EndpointStatus `
-                -Uri ([uri]::new($functionBaseUri, 'health/ready')) `
-                -ExpectedBodyStatus 'ready' `
-                -Timeout ([TimeSpan]::FromSeconds(60))
-            $validation.waits += $readinessConvergence
-            $validation.coldWake.readinessConvergenceMilliseconds =
-                $readinessConvergence.elapsedMilliseconds
-        }
-        $warmReady = Invoke-HealthContract `
-            -Client $client `
-            -Uri ([uri]::new($functionBaseUri, 'health/ready')) `
-            -ExpectedBodyStatus 'ready' `
-            -Phase 'warm-after-cold-readiness' `
-            -HostLabel 'Function'
-        $validation.contracts += @($warmReady)
-
-        $validation.contracts += @(
-            Invoke-FunctionContractValidation `
-                -Client $client `
-                -BaseUri $functionBaseUri
-        )
         $wrongAudienceToken = $null
         try {
             $wrongAudienceToken = Get-WrongAudienceAccessToken `
@@ -337,31 +649,6 @@ try {
         finally {
             $wrongAudienceToken = $null
         }
-
-        $coldPngScaleSeconds = Wait-RenderScaledToZero `
-            -Subscription $canonicalSubscriptionId `
-            -ContainerAppResourceId $renderState.id `
-            -RevisionName $renderState.properties.latestRevisionName
-        $validation.coldWake.pngScaleToZeroSeconds =
-            $coldPngScaleSeconds
-        $coldPng = Invoke-RenderContract `
-            -Client $client `
-            -Uri ([uri]::new($functionBaseUri, 'api/renders/png')) `
-            -Format 'png' `
-            -Phase 'cold-png' `
-            -HostLabel 'Function'
-        $warmPng = Invoke-RenderContract `
-            -Client $client `
-            -Uri ([uri]::new($functionBaseUri, 'api/renders/png')) `
-            -Format 'png' `
-            -Phase 'warm-after-cold-png' `
-            -HostLabel 'Function'
-
-        $validation.contracts += @(
-            $coldPng,
-            $warmPng
-        )
-        $liveValidationEndedAt = [DateTimeOffset]::UtcNow
     }
     finally {
         $client.Dispose()
@@ -390,12 +677,14 @@ try {
     }
     $validation.render.replicaCountAfterValidation = $finalReplicas.Count
 
-    $validation.telemetry = Get-DependencyTelemetryEvidence `
+    $validation.telemetry = Get-FunctionAuthorizationTelemetryEvidence `
         -Subscription $canonicalSubscriptionId `
         -GroupName $ResourceGroupName `
         -ApplicationName $ApplicationInsightsName `
-        -StartTime $liveValidationStartedAt `
-        -EndTime $liveValidationEndedAt `
+        -NoKeyStartTime $functionAuthorization.noKeyWindow.startTime `
+        -NoKeyEndTime $functionAuthorization.noKeyWindow.endTime `
+        -KeyedStartTime $functionAuthorization.keyedWindow.startTime `
+        -KeyedEndTime $functionAuthorization.keyedWindow.endTime `
         -RenderHostName $renderFqdn
     $outcome = Resolve-AzureDevValidationOutcome `
         -Telemetry $validation.telemetry `
@@ -421,16 +710,17 @@ Write-Host "Sanitized validation: $summaryPath"
 if ($validation.evidenceGaps.Count -gt 0) {
     $evidenceGapCodes = $validation.evidenceGaps.code -join ', '
     Write-Warning (
-        'P02 HTTP, auth-policy, revision, probe, and replica validation passed, ' +
+        'P03 HTTP, auth-policy, revision, probe, and replica validation passed, ' +
         "but evidence gaps remain: $evidenceGapCodes.")
 }
 else {
-    Write-Host 'P02 protected-Render Azure validation passed.'
+    Write-Host 'P03 Function-key and protected-Render Azure validation passed.'
 }
 }
 
 Export-ModuleMember -Function @(
     'Get-ExpectedRenderIdentityId',
     'Invoke-Html2bAzureDevValidation',
-    'Resolve-AzureDevValidationOutcome'
+    'Resolve-AzureDevValidationOutcome',
+    'Test-ExistingDefaultFunctionHostKey'
 )

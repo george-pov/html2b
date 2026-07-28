@@ -1,25 +1,31 @@
 @Html2b.AzureFunctions_HostAddress = http://localhost:8080
+@Html2b.AzureFunctions_FunctionKey = <function-key>
 
 GET {{Html2b.AzureFunctions_HostAddress}}/health/live
 
 ###
 
 GET {{Html2b.AzureFunctions_HostAddress}}/health/ready
+x-functions-key: {{Html2b.AzureFunctions_FunctionKey}}
 
 ###
 
 POST {{Html2b.AzureFunctions_HostAddress}}/api/renders/png
+x-functions-key: {{Html2b.AzureFunctions_FunctionKey}}
 
 ###
 
 POST {{Html2b.AzureFunctions_HostAddress}}/api/renders/jpeg
+x-functions-key: {{Html2b.AzureFunctions_FunctionKey}}
 
 ###
 
 POST {{Html2b.AzureFunctions_HostAddress}}/api/renders/pdf
+x-functions-key: {{Html2b.AzureFunctions_FunctionKey}}
 
 ###
 
 POST {{Html2b.AzureFunctions_HostAddress}}/api/renders/gif
+x-functions-key: {{Html2b.AzureFunctions_FunctionKey}}
 
 ###

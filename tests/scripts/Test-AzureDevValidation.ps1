@@ -6,21 +6,19 @@ $ErrorActionPreference = 'Stop'
 
 $repositoryRoot = (Resolve-Path (Join-Path $PSScriptRoot '..\..')).Path
 $azureScripts = Join-Path $repositoryRoot 'scripts\azure'
-Import-Module `
-    (Join-Path $azureScripts 'Html2b.OutputContracts.psm1') `
-    -Force
-Import-Module `
-    (Join-Path $azureScripts 'Html2b.AzureStateValidation.psm1') `
-    -Force
-Import-Module `
-    (Join-Path $azureScripts 'Html2b.HttpValidation.psm1') `
-    -Force
-Import-Module `
-    (Join-Path $azureScripts 'Html2b.TelemetryEvidence.psm1') `
-    -Force
+$entryScript = Join-Path $azureScripts 'Test-AzureDev.ps1'
 Import-Module `
     (Join-Path $azureScripts 'Html2b.AzureDevValidation.psm1') `
     -Force
+foreach ($focusedModuleName in @(
+        'Html2b.OutputContracts.psm1',
+        'Html2b.AzureStateValidation.psm1',
+        'Html2b.HttpValidation.psm1',
+        'Html2b.TelemetryEvidence.psm1')) {
+    Import-Module `
+        (Join-Path $azureScripts $focusedModuleName) `
+        -Force
+}
 
 $script:TestCount = 0
 
@@ -71,6 +69,32 @@ function Assert-Throws {
 }
 
 $azureValidationModule = Get-Module Html2b.AzureDevValidation
+$azureValidationModuleAst =
+    $azureValidationModule.SessionState.InvokeCommand.
+        GetCommand(
+            'Invoke-Html2bAzureDevValidation',
+            [System.Management.Automation.CommandTypes]::Function).
+        ScriptBlock.Ast.Parent.Parent
+$forcedDependencyImports = @(
+    $azureValidationModuleAst.FindAll(
+        {
+            param($Node)
+
+            $Node -is [System.Management.Automation.Language.CommandAst] -and
+            $Node.GetCommandName() -eq 'Import-Module'
+        },
+        $true)
+)
+Assert-Equal `
+    $forcedDependencyImports.Count `
+    3 `
+    'Azure validation module dependency import count mismatch.'
+foreach ($dependencyImport in $forcedDependencyImports) {
+    Assert-Equal `
+        ($dependencyImport.CommandElements.Extent.Text -contains '-Force') `
+        $true `
+        'Azure validation module can retain a stale dependency module.'
+}
 $requiredOrchestrationCommands = @(
     'Assert-AccountConfiguration'
     'Assert-FunctionConfiguration'
@@ -80,6 +104,7 @@ $requiredOrchestrationCommands = @(
     'ConvertTo-CanonicalGuid'
     'Get-AccountState'
     'Get-DependencyTelemetryEvidence'
+    'Get-FunctionAuthorizationTelemetryEvidence'
     'Get-FunctionAppState'
     'Get-FunctionRenderSettings'
     'Get-RenderAuthenticationState'
@@ -87,6 +112,7 @@ $requiredOrchestrationCommands = @(
     'Get-RenderRevisions'
     'Get-RevisionReplicas'
     'Get-WrongAudienceAccessToken'
+    'Invoke-ExpectedFunctionAuthorizationRejection'
     'Invoke-FunctionContractValidation'
     'Invoke-HealthContract'
     'Invoke-RenderAuthorizationMatrix'
@@ -111,6 +137,377 @@ Assert-Equal `
     $missingOrchestrationCommands.Count `
     0 `
     'Azure validation module has unresolved orchestration dependencies.'
+
+$entryCommand = Get-Command $entryScript
+$entryKeyParameter = $entryCommand.Parameters['FunctionHostKeyName']
+$entryKeyValidateSet = @(
+    $entryKeyParameter.Attributes |
+        Where-Object { $_ -is [System.Management.Automation.ValidateSetAttribute] }
+)
+Assert-Equal `
+    ($entryKeyValidateSet[0].ValidValues -join ',') `
+    'default' `
+    'Azure validator entry key-name contract mismatch.'
+$entryKeyParameterAst = @(
+    $entryCommand.ScriptBlock.Ast.ParamBlock.Parameters |
+        Where-Object {
+            $_.Name.VariablePath.UserPath -eq 'FunctionHostKeyName'
+        }
+)
+Assert-Equal `
+    $entryKeyParameterAst[0].DefaultValue.Value `
+    'default' `
+    'Azure validator entry key-name default mismatch.'
+
+$orchestrationCommand = Get-Command Invoke-Html2bAzureDevValidation
+$orchestrationKeyParameter =
+    $orchestrationCommand.Parameters['FunctionHostKeyName']
+$orchestrationKeyValidateSet = @(
+    $orchestrationKeyParameter.Attributes |
+        Where-Object { $_ -is [System.Management.Automation.ValidateSetAttribute] }
+)
+Assert-Equal `
+    ($orchestrationKeyValidateSet[0].ValidValues -join ',') `
+    'default' `
+    'Azure validation orchestration key-name contract mismatch.'
+$orchestrationKeyParameterAst = @(
+    $orchestrationCommand.ScriptBlock.Ast.Body.ParamBlock.Parameters |
+        Where-Object {
+            $_.Name.VariablePath.UserPath -eq 'FunctionHostKeyName'
+        }
+)
+Assert-Equal `
+    $orchestrationKeyParameterAst[0].DefaultValue.Value `
+    'default' `
+    'Azure validation orchestration key-name default mismatch.'
+
+$functionAuthorizationCommand = & $azureValidationModule {
+    Get-Command Invoke-FunctionAuthorizationValidation
+}
+$functionAuthorizationSource =
+    $functionAuthorizationCommand.ScriptBlock.ToString()
+Assert-Equal `
+    $azureValidationModule.ExportedCommands.ContainsKey(
+        'Invoke-FunctionAuthorizationValidation') `
+    $false `
+    'Secret-bearing Function authorization orchestration is publicly exported.'
+$functionAuthorizationKeyParameter =
+    $functionAuthorizationCommand.Parameters['FunctionHostKeyName']
+$functionAuthorizationKeyValidateSet = @(
+    $functionAuthorizationKeyParameter.Attributes |
+        Where-Object { $_ -is [System.Management.Automation.ValidateSetAttribute] }
+)
+Assert-Equal `
+    ($functionAuthorizationKeyValidateSet[0].ValidValues -join ',') `
+    'default' `
+    'Function authorization validation key-name contract mismatch.'
+$functionAuthorizationKeyParameterAst = @(
+    $functionAuthorizationCommand.ScriptBlock.Ast.Body.ParamBlock.Parameters |
+        Where-Object {
+            $_.Name.VariablePath.UserPath -eq 'FunctionHostKeyName'
+        }
+)
+Assert-Equal `
+    $functionAuthorizationKeyParameterAst[0].DefaultValue.Value `
+    'default' `
+    'Function authorization validation key-name default mismatch.'
+Assert-Equal `
+    $functionAuthorizationSource.Contains(
+        'Assert-ExpectedFunctionBaseUri -BaseUri $BaseUri -AppName $AppName') `
+    $true `
+    'Function authorization orchestration does not enforce its exact origin.'
+
+$keyHelperSource = & $azureValidationModule {
+    (Get-Command Get-ExistingDefaultFunctionHostKey).ScriptBlock.ToString()
+}
+$keyHelperThrowText = & $azureValidationModule {
+    (Get-Command Get-ExistingDefaultFunctionHostKey).ScriptBlock.Ast.FindAll(
+        {
+            param($Node)
+            $Node -is [System.Management.Automation.Language.ThrowStatementAst]
+        },
+        $true).Extent.Text -join "`n"
+}
+Assert-Equal `
+    $azureValidationModule.ExportedCommands.ContainsKey(
+        'Get-ExistingDefaultFunctionHostKey') `
+    $false `
+    'Plaintext Function host-key retrieval is publicly exported.'
+Assert-Equal `
+    $azureValidationModule.ExportedCommands.ContainsKey(
+        'Test-ExistingDefaultFunctionHostKey') `
+    $true `
+    'Sanitized Function host-key preflight is not exported.'
+Assert-Equal `
+    ($keyHelperSource -match 'Invoke-AzureCli') `
+    $false `
+    'Function host-key retrieval uses the general Azure CLI helper.'
+Assert-Equal `
+    $keyHelperSource.Contains('& az functionapp keys list') `
+    $true `
+    'Function host-key retrieval command mismatch.'
+Assert-Equal `
+    $keyHelperSource.Contains("--query 'functionKeys.default'") `
+    $true `
+    'Function host-key retrieval query mismatch.'
+Assert-Equal `
+    $keyHelperSource.Contains('--output tsv') `
+    $true `
+    'Function host-key retrieval output mode mismatch.'
+Assert-Equal `
+    $keyHelperSource.Contains('--only-show-errors') `
+    $true `
+    'Function host-key retrieval error-handling mismatch.'
+foreach ($redirectedStream in @(
+        '2>$null',
+        '3>$null',
+        '4>$null',
+        '5>$null',
+        '6>$null')) {
+    Assert-Equal `
+        $keyHelperSource.Contains($redirectedStream) `
+        $true `
+        "Function host-key retrieval does not suppress $redirectedStream."
+}
+Assert-Equal `
+    ($keyHelperThrowText -match '\$functionHostKey') `
+    $false `
+    'Function host-key failure text can expose captured secret material.'
+
+$sentinelFunctionKey = 'sentinel-function-key-never-emit'
+$privateKeyProbe = & $azureValidationModule {
+    param($SentinelFunctionKey)
+
+    function az {
+        $global:LASTEXITCODE = 0
+        $SentinelFunctionKey
+    }
+
+    $functionHostKey = $null
+    try {
+        $functionHostKey = Get-ExistingDefaultFunctionHostKey `
+            -Subscription 'subscription-id' `
+            -GroupName 'resource-group' `
+            -AppName 'func-html2b-api-dev'
+        [ordered]@{
+            matched = $functionHostKey -ceq $SentinelFunctionKey
+        }
+    }
+    finally {
+        $functionHostKey = $null
+        Remove-Item Function:\az -ErrorAction SilentlyContinue
+        $global:LASTEXITCODE = 0
+    }
+} $sentinelFunctionKey
+Assert-Equal `
+    $privateKeyProbe.matched `
+    $true `
+    'Private Function host-key retrieval did not capture the exact CLI value.'
+
+$safePreflightStreams = @(
+    & $azureValidationModule {
+        param($SentinelFunctionKey)
+
+        function az {
+            Write-Warning $SentinelFunctionKey
+            Write-Verbose $SentinelFunctionKey -Verbose
+            Write-Debug $SentinelFunctionKey -Debug
+            Write-Information $SentinelFunctionKey -InformationAction Continue
+            $global:LASTEXITCODE = 0
+            $SentinelFunctionKey
+        }
+
+        try {
+            Test-ExistingDefaultFunctionHostKey `
+                -Subscription 'subscription-id' `
+                -GroupName 'resource-group' `
+                -AppName 'func-html2b-api-dev'
+        }
+        finally {
+            Remove-Item Function:\az -ErrorAction SilentlyContinue
+            $global:LASTEXITCODE = 0
+        }
+    } $sentinelFunctionKey *>&1
+)
+Assert-Equal `
+    $safePreflightStreams.Count `
+    1 `
+    'Sanitized Function host-key preflight emitted unexpected streams.'
+$safePreflight = $safePreflightStreams[0]
+Assert-Equal `
+    (($safePreflight.Keys | Sort-Object) -join ',') `
+    'keyName,status' `
+    'Sanitized Function host-key preflight returned unexpected fields.'
+Assert-Equal `
+    $safePreflight.keyName `
+    'default' `
+    'Sanitized Function host-key preflight key name mismatch.'
+Assert-Equal `
+    $safePreflight.status `
+    'passed' `
+    'Sanitized Function host-key preflight status mismatch.'
+Assert-Equal `
+    (($safePreflightStreams | ConvertTo-Json -Depth 10) -match
+        [regex]::Escape($sentinelFunctionKey)) `
+    $false `
+    'Sanitized Function host-key preflight exposed secret material.'
+
+Assert-Throws `
+    -Action {
+        & $azureValidationModule {
+            function az {
+                $global:LASTEXITCODE = 0
+                ' '
+            }
+
+            try {
+                Test-ExistingDefaultFunctionHostKey `
+                    -Subscription 'subscription-id' `
+                    -GroupName 'resource-group' `
+                    -AppName 'func-html2b-api-dev'
+            }
+            finally {
+                Remove-Item Function:\az -ErrorAction SilentlyContinue
+                $global:LASTEXITCODE = 0
+            }
+        }
+    } `
+    -ExpectedMessage 'The existing default Function host key is missing.' `
+    -Message 'Function host-key preflight accepted blank CLI output.'
+
+Assert-Throws `
+    -Action {
+        & $azureValidationModule {
+            param($SentinelFunctionKey)
+
+            function az {
+                $global:LASTEXITCODE = 9
+                $SentinelFunctionKey
+            }
+
+            try {
+                Test-ExistingDefaultFunctionHostKey `
+                    -Subscription 'subscription-id' `
+                    -GroupName 'resource-group' `
+                    -AppName 'func-html2b-api-dev'
+            }
+            finally {
+                Remove-Item Function:\az -ErrorAction SilentlyContinue
+                $global:LASTEXITCODE = 0
+            }
+        } $sentinelFunctionKey
+    } `
+    -ExpectedMessage 'Unable to read the existing default Function host key.' `
+    -Message 'Function host-key preflight exposed nonzero CLI output.'
+
+foreach ($invalidFunctionBaseUri in @(
+        [uri] 'http://func-html2b-api-dev.azurewebsites.net/',
+        [uri] 'https://attacker.example/')) {
+    Assert-Throws `
+        -Action {
+            & $azureValidationModule {
+                param($InvalidFunctionBaseUri)
+
+                Assert-ExpectedFunctionBaseUri `
+                    -AppName 'func-html2b-api-dev' `
+                    -BaseUri $InvalidFunctionBaseUri
+            } $invalidFunctionBaseUri
+        } `
+        -ExpectedMessage `
+            'Function validation requires the expected HTTPS Function origin.' `
+        -Message 'Function authorization accepted an unsafe Function origin.'
+}
+
+$rendersFunctionSource = Get-Content `
+    (Join-Path $repositoryRoot `
+        'src\api\Html2b.AzureFunctions\Functions\RendersFunction.cs') `
+    -Raw
+$healthFunctionsSource = Get-Content `
+    (Join-Path $repositoryRoot `
+        'src\api\Html2b.AzureFunctions\Functions\HealthFunctions.cs') `
+    -Raw
+$functionTriggerSource =
+    $rendersFunctionSource + "`n" + $healthFunctionsSource
+Assert-Equal `
+    ([regex]::Matches(
+        $functionTriggerSource,
+        'AuthorizationLevel\.Function').Count) `
+    2 `
+    'Function trigger authorization count mismatch.'
+Assert-Equal `
+    ([regex]::Matches(
+        $functionTriggerSource,
+        'AuthorizationLevel\.Anonymous').Count) `
+    1 `
+    'Anonymous Function trigger count mismatch.'
+Assert-Equal `
+    ($rendersFunctionSource -match
+        '(?s)\[Function\("RenderPoc"\)\].+AuthorizationLevel\.Function.+Route = "api/renders/\{format\}"') `
+    $true `
+    'RenderPoc is not the expected Function-authorized trigger.'
+Assert-Equal `
+    ($healthFunctionsSource -match
+        '(?s)\[Function\("HealthLive"\)\].+?AuthorizationLevel\.Anonymous.+?Route = "health/live"') `
+    $true `
+    'HealthLive is not the expected anonymous trigger.'
+Assert-Equal `
+    ($healthFunctionsSource -match
+        '(?s)\[Function\("HealthReady"\)\].+?AuthorizationLevel\.Function.+?Route = "health/ready"') `
+    $true `
+    'HealthReady is not the expected Function-authorized trigger.'
+
+$httpRequestSource = Get-Content `
+    (Join-Path $repositoryRoot `
+        'src\api\Html2b.AzureFunctions\Html2b.AzureFunctions.http') `
+    -Raw
+Assert-Equal `
+    ([regex]::Matches(
+        $httpRequestSource,
+        '(?m)^@Html2b\.AzureFunctions_FunctionKey = <function-key>$').Count) `
+    1 `
+    'Function request samples do not declare the exact key placeholder once.'
+Assert-Equal `
+    ([regex]::Matches(
+        $httpRequestSource,
+        '(?m)^x-functions-key: \{\{Html2b\.AzureFunctions_FunctionKey\}\}$').Count) `
+    5 `
+    'Function request samples do not have the expected placeholder headers.'
+$httpRequestBlocks = @(
+    $httpRequestSource -split '(?m)^###\s*$'
+)
+$liveRequestBlock = @(
+    $httpRequestBlocks |
+        Where-Object { $_ -match '/health/live' }
+)
+Assert-Equal `
+    $liveRequestBlock.Count `
+    1 `
+    'Function request samples have an invalid liveness block.'
+Assert-Equal `
+    ($liveRequestBlock[0] -match '(?m)^x-functions-key:') `
+    $false `
+    'Function liveness request sample unexpectedly sends a key.'
+foreach ($keyedPath in @(
+        '/health/ready',
+        '/api/renders/png',
+        '/api/renders/jpeg',
+        '/api/renders/pdf',
+        '/api/renders/gif')) {
+    $keyedRequestBlock = @(
+        $httpRequestBlocks |
+            Where-Object { $_ -match [regex]::Escape($keyedPath) }
+    )
+    Assert-Equal `
+        $keyedRequestBlock.Count `
+        1 `
+        "Function request samples have an invalid $keyedPath block."
+    Assert-Equal `
+        ([regex]::Matches(
+            $keyedRequestBlock[0],
+            '(?m)^x-functions-key: \{\{Html2b\.AzureFunctions_FunctionKey\}\}$').Count) `
+        1 `
+        "Function request sample $keyedPath does not send the placeholder key."
+}
 
 $azureStateValidationModule = Get-Module Html2b.AzureStateValidation
 $authProjection = & $azureStateValidationModule {
@@ -268,6 +665,53 @@ public sealed class AlwaysUnauthorizedHandler : HttpMessageHandler
             new HttpResponseMessage(HttpStatusCode.Unauthorized));
     }
 }
+
+public sealed class AlwaysOkHandler : HttpMessageHandler
+{
+    protected override Task<HttpResponseMessage> SendAsync(
+        HttpRequestMessage request,
+        CancellationToken cancellationToken)
+    {
+        return Task.FromResult(
+            new HttpResponseMessage(HttpStatusCode.OK));
+    }
+}
+
+public sealed class LiveHealthHandler : HttpMessageHandler
+{
+    protected override Task<HttpResponseMessage> SendAsync(
+        HttpRequestMessage request,
+        CancellationToken cancellationToken)
+    {
+        return Task.FromResult(
+            new HttpResponseMessage(HttpStatusCode.OK)
+            {
+                Content = new StringContent(
+                    "{\"status\":\"live\"}",
+                    System.Text.Encoding.UTF8,
+                    "application/json"),
+            });
+    }
+}
+
+public sealed class TrackingHandler : HttpMessageHandler
+{
+    public bool IsDisposed { get; private set; }
+
+    protected override Task<HttpResponseMessage> SendAsync(
+        HttpRequestMessage request,
+        CancellationToken cancellationToken)
+    {
+        return Task.FromResult(
+            new HttpResponseMessage(HttpStatusCode.InternalServerError));
+    }
+
+    protected override void Dispose(bool disposing)
+    {
+        IsDisposed = disposing;
+        base.Dispose(disposing);
+    }
+}
 '@
 }
 
@@ -294,6 +738,84 @@ Assert-Equal `
     @($authorizationResults | Where-Object status -EQ 'skipped').Count `
     1 `
     'Authorization matrix did not retain the safe wrong-principal skip.'
+
+$functionRejectionClient = [System.Net.Http.HttpClient]::new(
+    [Html2b.Tests.AlwaysUnauthorizedHandler]::new())
+try {
+    $functionRejectionResults = @(
+        Invoke-ExpectedFunctionAuthorizationRejection `
+            -Client $functionRejectionClient `
+            -Uri ([uri] 'https://function.example/health/ready') `
+            -Method 'GET' `
+            -Scenario 'ready-without-key'
+        Invoke-ExpectedFunctionAuthorizationRejection `
+            -Client $functionRejectionClient `
+            -Uri ([uri] 'https://function.example/api/renders/png') `
+            -Method 'POST' `
+            -Scenario 'render-without-key'
+    )
+}
+finally {
+    $functionRejectionClient.Dispose()
+}
+Assert-Equal `
+    $functionRejectionResults.Count `
+    2 `
+    'Function no-key authorization matrix size mismatch.'
+Assert-Equal `
+    @($functionRejectionResults | Where-Object httpStatus -EQ 401).Count `
+    2 `
+    'Function no-key authorization result mismatch.'
+Assert-Equal `
+    (($functionRejectionResults | ConvertTo-Json -Depth 10) -match
+        'x-functions-key') `
+    $false `
+    'Function authorization result serialized a key header.'
+
+$functionOkClient = [System.Net.Http.HttpClient]::new(
+    [Html2b.Tests.AlwaysOkHandler]::new())
+try {
+    Assert-Throws `
+        -Action {
+            Invoke-ExpectedFunctionAuthorizationRejection `
+                -Client $functionOkClient `
+                -Uri ([uri] 'https://function.example/health/ready') `
+                -Method 'GET' `
+                -Scenario 'ready-without-key'
+        } `
+        -ExpectedMessage `
+            'Function ready-without-key returned HTTP 200 instead of 401.' `
+        -Message 'Function authorization accepted a non-rejection response.'
+}
+finally {
+    $functionOkClient.Dispose()
+}
+
+$liveHealthClient = [System.Net.Http.HttpClient]::new(
+    [Html2b.Tests.LiveHealthHandler]::new())
+try {
+    $liveWait = Wait-EndpointStatus `
+        -Client $liveHealthClient `
+        -Uri ([uri] 'https://function.example/health/live') `
+        -ExpectedBodyStatus 'live' `
+        -Timeout ([TimeSpan]::FromSeconds(1))
+    Assert-Equal $liveWait.httpStatus 200 'Function live wait status mismatch.'
+
+    $followUpLiveResponse = $liveHealthClient.GetAsync(
+        'https://function.example/health/live').GetAwaiter().GetResult()
+    try {
+        Assert-Equal `
+            ([int] $followUpLiveResponse.StatusCode) `
+            200 `
+            'Wait-EndpointStatus disposed its caller-owned client.'
+    }
+    finally {
+        $followUpLiveResponse.Dispose()
+    }
+}
+finally {
+    $liveHealthClient.Dispose()
+}
 
 $telemetryModule = Get-Module Html2b.TelemetryEvidence
 $telemetryStart = [DateTimeOffset] '2026-07-27T22:00:00Z'
@@ -465,6 +987,522 @@ foreach ($case in $dependencyQualificationCases) {
         "Dependency telemetry qualification mismatch for $($case.label)."
 }
 
+$readinessDependencyRecord = [pscustomobject]@{
+    timestamp = '2026-07-27T22:01:00Z'
+    name = 'GET /health/ready'
+    type = 'Http'
+    target = 'render.example'
+    resultCode = '200'
+    success = $true
+    duration = '10.5'
+    operationId = 'readiness-operation-id'
+}
+$renderDependencyRecord = [pscustomobject]@{
+    timestamp = '2026-07-27T22:02:00Z'
+    name = 'POST /internal/renders'
+    type = 'Http'
+    target = 'render.example'
+    resultCode = '200'
+    success = $true
+    duration = '20.5'
+    operationId = 'render-operation-id'
+}
+$functionAuthorizationTelemetry = & $telemetryModule {
+    param(
+        $ReadinessRecord,
+        $RenderRecord,
+        $NoKeyStartTime,
+        $NoKeyEndTime,
+        $KeyedStartTime,
+        $KeyedEndTime)
+
+    Resolve-FunctionAuthorizationTelemetryEvidence `
+        -NoKeyRecords @() `
+        -KeyedRecords @($ReadinessRecord, $RenderRecord) `
+        -NoKeyStartTime $NoKeyStartTime `
+        -NoKeyEndTime $NoKeyEndTime `
+        -KeyedStartTime $KeyedStartTime `
+        -KeyedEndTime $KeyedEndTime `
+        -RenderHostName 'render.example'
+} `
+    $readinessDependencyRecord `
+    $renderDependencyRecord `
+    $telemetryStart `
+    $telemetryStart.AddMinutes(1) `
+    $telemetryStart.AddMinutes(2) `
+    $telemetryEnd
+Assert-Equal `
+    $functionAuthorizationTelemetry.status `
+    'available' `
+    'Function authorization telemetry did not pass complete evidence.'
+Assert-Equal `
+    $functionAuthorizationTelemetry.noKey.recordCount `
+    0 `
+    'Function authorization telemetry retained a no-key dependency.'
+Assert-Equal `
+    $functionAuthorizationTelemetry.keyed.readinessDependencyCount `
+    1 `
+    'Function authorization telemetry readiness count mismatch.'
+Assert-Equal `
+    $functionAuthorizationTelemetry.keyed.renderDependencyCount `
+    1 `
+    'Function authorization telemetry render count mismatch.'
+
+$missingRenderTelemetry = & $telemetryModule {
+    param(
+        $ReadinessRecord,
+        $NoKeyStartTime,
+        $NoKeyEndTime,
+        $KeyedStartTime,
+        $KeyedEndTime)
+
+    Resolve-FunctionAuthorizationTelemetryEvidence `
+        -NoKeyRecords @() `
+        -KeyedRecords @($ReadinessRecord) `
+        -NoKeyStartTime $NoKeyStartTime `
+        -NoKeyEndTime $NoKeyEndTime `
+        -KeyedStartTime $KeyedStartTime `
+        -KeyedEndTime $KeyedEndTime `
+        -RenderHostName 'render.example'
+} `
+    $readinessDependencyRecord `
+    $telemetryStart `
+    $telemetryStart.AddMinutes(1) `
+    $telemetryStart.AddMinutes(2) `
+    $telemetryEnd
+Assert-Equal `
+    $missingRenderTelemetry.status `
+    'not-observed' `
+    'Function authorization telemetry accepted incomplete keyed evidence.'
+Assert-Equal `
+    $missingRenderTelemetry.noKey.status `
+    'passed' `
+    'Function authorization telemetry masked the independent no-key result.'
+
+Assert-Throws `
+    -Action {
+        & $telemetryModule {
+            param(
+                $NoKeyRecord,
+                $ReadinessRecord,
+                $RenderRecord,
+                $NoKeyStartTime,
+                $NoKeyEndTime,
+                $KeyedStartTime,
+                $KeyedEndTime)
+
+            Resolve-FunctionAuthorizationTelemetryEvidence `
+                -NoKeyRecords @($NoKeyRecord) `
+                -KeyedRecords @($ReadinessRecord, $RenderRecord) `
+                -NoKeyStartTime $NoKeyStartTime `
+                -NoKeyEndTime $NoKeyEndTime `
+                -KeyedStartTime $KeyedStartTime `
+                -KeyedEndTime $KeyedEndTime `
+                -RenderHostName 'render.example'
+        } `
+            $renderDependencyRecord `
+            $readinessDependencyRecord `
+            $renderDependencyRecord `
+            $telemetryStart `
+            $telemetryStart.AddMinutes(1) `
+            $telemetryStart.AddMinutes(2) `
+            $telemetryEnd
+    } `
+    -ExpectedMessage `
+        'No-key Function validation produced a Render dependency.' `
+    -Message 'Function authorization telemetry accepted a no-key dependency.'
+
+$guardedTelemetryWindows = & $azureValidationModule {
+    New-FunctionAuthorizationTelemetryWindows `
+        -NoKeyStartTime (
+            [DateTimeOffset] '2026-07-27T22:00:10Z') `
+        -NoKeyEndTime (
+            [DateTimeOffset] '2026-07-27T22:00:20Z') `
+        -KeyedStartTime (
+            [DateTimeOffset] '2026-07-27T22:01:21Z') `
+        -KeyedEndTime (
+            [DateTimeOffset] '2026-07-27T22:01:30Z')
+}
+Assert-Equal `
+    $guardedTelemetryWindows.clockSkewGuardSeconds `
+    30.0 `
+    'Function telemetry clock-skew guard mismatch.'
+Assert-Equal `
+    $guardedTelemetryWindows.noKeyWindow.startTime.ToString('o') `
+    '2026-07-27T21:59:40.0000000+00:00' `
+    'No-key telemetry window did not include its leading guard.'
+Assert-Equal `
+    $guardedTelemetryWindows.noKeyWindow.endTime.ToString('o') `
+    '2026-07-27T22:00:50.0000000+00:00' `
+    'No-key telemetry window did not include its trailing guard.'
+$justOutsideClientNoKeyWindow =
+    [DateTimeOffset] '2026-07-27T22:00:40Z'
+Assert-Equal `
+    ($justOutsideClientNoKeyWindow -le
+        $guardedTelemetryWindows.noKeyWindow.endTime) `
+    $true `
+    'No-key telemetry guard omitted a clock-skewed dependency timestamp.'
+Assert-Equal `
+    ($guardedTelemetryWindows.noKeyWindow.endTime -lt
+        $guardedTelemetryWindows.keyedWindow.startTime) `
+    $true `
+    'Function authorization telemetry guard windows overlap.'
+Assert-Throws `
+    -Action {
+        & $azureValidationModule {
+            New-FunctionAuthorizationTelemetryWindows `
+                -NoKeyStartTime (
+                    [DateTimeOffset] '2026-07-27T22:00:10Z') `
+                -NoKeyEndTime (
+                    [DateTimeOffset] '2026-07-27T22:00:20Z') `
+                -KeyedStartTime (
+                    [DateTimeOffset] '2026-07-27T22:00:50Z') `
+                -KeyedEndTime (
+                    [DateTimeOffset] '2026-07-27T22:01:00Z')
+        }
+    } `
+    -ExpectedMessage `
+        'Function authorization telemetry guard windows overlap.' `
+    -Message 'Function telemetry accepted overlapping guarded windows.'
+
+$publicTelemetryEvidence = & $telemetryModule {
+    param(
+        $NoKeyStartTime,
+        $NoKeyEndTime,
+        $KeyedStartTime,
+        $KeyedEndTime,
+        $ReadinessRecord,
+        $RenderRecord)
+
+    $script:NoKeyTelemetryProbeCount = 0
+    $script:KeyedTelemetryProbeCount = 0
+    $script:NoKeyTelemetryProbeStart = $NoKeyStartTime
+    $script:PublicReadinessRecord = $ReadinessRecord
+    $script:PublicRenderRecord = $RenderRecord
+    function Get-SanitizedDependencyTelemetry {
+        param(
+            [string] $Subscription,
+            [string] $GroupName,
+            [string] $ApplicationName,
+            [DateTimeOffset] $StartTime,
+            [DateTimeOffset] $EndTime,
+            [string] $RenderHostName
+        )
+
+        if ($StartTime -eq $script:NoKeyTelemetryProbeStart) {
+            $script:NoKeyTelemetryProbeCount++
+            return @()
+        }
+
+        $script:KeyedTelemetryProbeCount++
+        return @(
+            $script:PublicReadinessRecord,
+            $script:PublicRenderRecord)
+    }
+
+    try {
+        $evidence = Get-FunctionAuthorizationTelemetryEvidence `
+            -Subscription 'subscription-id' `
+            -GroupName 'resource-group' `
+            -ApplicationName 'application-insights' `
+            -NoKeyStartTime $NoKeyStartTime `
+            -NoKeyEndTime $NoKeyEndTime `
+            -KeyedStartTime $KeyedStartTime `
+            -KeyedEndTime $KeyedEndTime `
+            -RenderHostName 'render.example' `
+            -Timeout ([TimeSpan]::FromMilliseconds(250))
+        return [ordered]@{
+            evidence = $evidence
+            noKeyProbeCount = $script:NoKeyTelemetryProbeCount
+            keyedProbeCount = $script:KeyedTelemetryProbeCount
+        }
+    }
+    finally {
+        Remove-Item Function:\Get-SanitizedDependencyTelemetry `
+            -ErrorAction SilentlyContinue
+        Remove-Variable NoKeyTelemetryProbeCount `
+            -Scope Script `
+            -ErrorAction SilentlyContinue
+        Remove-Variable KeyedTelemetryProbeCount `
+            -Scope Script `
+            -ErrorAction SilentlyContinue
+        Remove-Variable NoKeyTelemetryProbeStart `
+            -Scope Script `
+            -ErrorAction SilentlyContinue
+        Remove-Variable PublicReadinessRecord `
+            -Scope Script `
+            -ErrorAction SilentlyContinue
+        Remove-Variable PublicRenderRecord `
+            -Scope Script `
+            -ErrorAction SilentlyContinue
+    }
+} `
+    $telemetryStart `
+    $telemetryStart.AddMinutes(1) `
+    $telemetryStart.AddMinutes(2) `
+    $telemetryEnd `
+    $readinessDependencyRecord `
+    $renderDependencyRecord
+Assert-Equal `
+    $publicTelemetryEvidence.evidence.status `
+    'available' `
+    'Public Function authorization telemetry did not pass complete evidence.'
+Assert-Equal `
+    ($publicTelemetryEvidence.noKeyProbeCount -gt 1) `
+    $true `
+    'Public telemetry did not hold the no-key absence observation.'
+Assert-Equal `
+    ($publicTelemetryEvidence.keyedProbeCount -gt 1) `
+    $true `
+    'Public telemetry did not continue polling keyed evidence.'
+
+Assert-Throws `
+    -Action {
+        & $telemetryModule {
+            param(
+                $NoKeyStartTime,
+                $NoKeyEndTime,
+                $KeyedStartTime,
+                $KeyedEndTime,
+                $ReadinessRecord,
+                $RenderRecord)
+
+            $script:DelayedNoKeyProbeCount = 0
+            $script:DelayedNoKeyProbeStart = $NoKeyStartTime
+            $script:DelayedNoKeyRecord = $RenderRecord
+            $script:DelayedReadinessRecord = $ReadinessRecord
+            function Get-SanitizedDependencyTelemetry {
+                param(
+                    [string] $Subscription,
+                    [string] $GroupName,
+                    [string] $ApplicationName,
+                    [DateTimeOffset] $StartTime,
+                    [DateTimeOffset] $EndTime,
+                    [string] $RenderHostName
+                )
+
+                if ($StartTime -eq $script:DelayedNoKeyProbeStart) {
+                    $script:DelayedNoKeyProbeCount++
+                    if ($script:DelayedNoKeyProbeCount -gt 1) {
+                        return @($script:DelayedNoKeyRecord)
+                    }
+
+                    return @()
+                }
+
+                return @(
+                    $script:DelayedReadinessRecord,
+                    $script:DelayedNoKeyRecord)
+            }
+
+            try {
+                Get-FunctionAuthorizationTelemetryEvidence `
+                    -Subscription 'subscription-id' `
+                    -GroupName 'resource-group' `
+                    -ApplicationName 'application-insights' `
+                    -NoKeyStartTime $NoKeyStartTime `
+                    -NoKeyEndTime $NoKeyEndTime `
+                    -KeyedStartTime $KeyedStartTime `
+                    -KeyedEndTime $KeyedEndTime `
+                    -RenderHostName 'render.example' `
+                    -Timeout ([TimeSpan]::FromMilliseconds(250))
+            }
+            finally {
+                Remove-Item Function:\Get-SanitizedDependencyTelemetry `
+                    -ErrorAction SilentlyContinue
+                Remove-Variable DelayedNoKeyProbeCount `
+                    -Scope Script `
+                    -ErrorAction SilentlyContinue
+                Remove-Variable DelayedNoKeyProbeStart `
+                    -Scope Script `
+                    -ErrorAction SilentlyContinue
+                Remove-Variable DelayedNoKeyRecord `
+                    -Scope Script `
+                    -ErrorAction SilentlyContinue
+                Remove-Variable DelayedReadinessRecord `
+                    -Scope Script `
+                    -ErrorAction SilentlyContinue
+            }
+        } `
+            $telemetryStart `
+            $telemetryStart.AddMinutes(1) `
+            $telemetryStart.AddMinutes(2) `
+            $telemetryEnd `
+            $readinessDependencyRecord `
+            $renderDependencyRecord
+    } `
+    -ExpectedMessage `
+        'No-key Function validation produced a Render dependency.' `
+    -Message 'Public telemetry accepted a delayed no-key dependency.'
+
+$noKeyQueryGap = & $telemetryModule {
+    param(
+        $NoKeyStartTime,
+        $NoKeyEndTime,
+        $KeyedStartTime,
+        $KeyedEndTime,
+        $ReadinessRecord,
+        $RenderRecord)
+
+    $script:FailingNoKeyProbeStart = $NoKeyStartTime
+    $script:GapReadinessRecord = $ReadinessRecord
+    $script:GapRenderRecord = $RenderRecord
+    function Get-SanitizedDependencyTelemetry {
+        param(
+            [string] $Subscription,
+            [string] $GroupName,
+            [string] $ApplicationName,
+            [DateTimeOffset] $StartTime,
+            [DateTimeOffset] $EndTime,
+            [string] $RenderHostName
+        )
+
+        if ($StartTime -eq $script:FailingNoKeyProbeStart) {
+            throw 'no-key-query-sentinel'
+        }
+
+        return @(
+            $script:GapReadinessRecord,
+            $script:GapRenderRecord)
+    }
+
+    try {
+        Get-FunctionAuthorizationTelemetryEvidence `
+            -Subscription 'subscription-id' `
+            -GroupName 'resource-group' `
+            -ApplicationName 'application-insights' `
+            -NoKeyStartTime $NoKeyStartTime `
+            -NoKeyEndTime $NoKeyEndTime `
+            -KeyedStartTime $KeyedStartTime `
+            -KeyedEndTime $KeyedEndTime `
+            -RenderHostName 'render.example' `
+            -Timeout ([TimeSpan]::Zero)
+    }
+    finally {
+        Remove-Item Function:\Get-SanitizedDependencyTelemetry `
+            -ErrorAction SilentlyContinue
+        Remove-Variable FailingNoKeyProbeStart `
+            -Scope Script `
+            -ErrorAction SilentlyContinue
+        Remove-Variable GapReadinessRecord `
+            -Scope Script `
+            -ErrorAction SilentlyContinue
+        Remove-Variable GapRenderRecord `
+            -Scope Script `
+            -ErrorAction SilentlyContinue
+    }
+} `
+    $telemetryStart `
+    $telemetryStart.AddMinutes(1) `
+    $telemetryStart.AddMinutes(2) `
+    $telemetryEnd `
+    $readinessDependencyRecord `
+    $renderDependencyRecord
+Assert-Equal `
+    $noKeyQueryGap.classification `
+    'evidence-gap' `
+    'Public telemetry masked a no-key query failure.'
+Assert-Equal `
+    $noKeyQueryGap.noKey.status `
+    'not-observed' `
+    'Public telemetry marked a failed no-key query as passed.'
+Assert-Equal `
+    $noKeyQueryGap.keyed.status `
+    'available' `
+    'Public telemetry masked independent keyed proof.'
+
+$keyedQueryGap = & $telemetryModule {
+    param(
+        $NoKeyStartTime,
+        $NoKeyEndTime,
+        $KeyedStartTime,
+        $KeyedEndTime)
+
+    $script:PassingNoKeyProbeStart = $NoKeyStartTime
+    function Get-SanitizedDependencyTelemetry {
+        param(
+            [string] $Subscription,
+            [string] $GroupName,
+            [string] $ApplicationName,
+            [DateTimeOffset] $StartTime,
+            [DateTimeOffset] $EndTime,
+            [string] $RenderHostName
+        )
+
+        if ($StartTime -eq $script:PassingNoKeyProbeStart) {
+            return @()
+        }
+
+        throw 'keyed-query-sentinel'
+    }
+
+    try {
+        Get-FunctionAuthorizationTelemetryEvidence `
+            -Subscription 'subscription-id' `
+            -GroupName 'resource-group' `
+            -ApplicationName 'application-insights' `
+            -NoKeyStartTime $NoKeyStartTime `
+            -NoKeyEndTime $NoKeyEndTime `
+            -KeyedStartTime $KeyedStartTime `
+            -KeyedEndTime $KeyedEndTime `
+            -RenderHostName 'render.example' `
+            -Timeout ([TimeSpan]::Zero)
+    }
+    finally {
+        Remove-Item Function:\Get-SanitizedDependencyTelemetry `
+            -ErrorAction SilentlyContinue
+        Remove-Variable PassingNoKeyProbeStart `
+            -Scope Script `
+            -ErrorAction SilentlyContinue
+    }
+} `
+    $telemetryStart `
+    $telemetryStart.AddMinutes(1) `
+    $telemetryStart.AddMinutes(2) `
+    $telemetryEnd
+Assert-Equal `
+    $keyedQueryGap.classification `
+    'evidence-gap' `
+    'Public telemetry masked a keyed query failure.'
+Assert-Equal `
+    $keyedQueryGap.noKey.status `
+    'passed' `
+    'Public telemetry masked independent no-key proof.'
+Assert-Equal `
+    $keyedQueryGap.keyed.status `
+    'not-observed' `
+    'Public telemetry marked a failed keyed query as available.'
+
+Assert-Throws `
+    -Action {
+        & $telemetryModule {
+            param($StartTime, $EndTime)
+
+            function Get-SanitizedDependencyTelemetry {
+                throw 'An invalid telemetry window reached the query path.'
+            }
+
+            try {
+                Get-FunctionAuthorizationTelemetryEvidence `
+                    -Subscription 'subscription-id' `
+                    -GroupName 'resource-group' `
+                    -ApplicationName 'application-insights' `
+                    -NoKeyStartTime $StartTime `
+                    -NoKeyEndTime $StartTime.AddMinutes(3) `
+                    -KeyedStartTime $StartTime.AddMinutes(2) `
+                    -KeyedEndTime $EndTime `
+                    -RenderHostName 'render.example' `
+                    -Timeout ([TimeSpan]::Zero)
+            }
+            finally {
+                Remove-Item Function:\Get-SanitizedDependencyTelemetry `
+                    -ErrorAction SilentlyContinue
+            }
+        } $telemetryStart $telemetryEnd
+    } `
+    -ExpectedMessage 'Function authorization telemetry windows are invalid.' `
+    -Message 'Public telemetry accepted overlapping query windows.'
+
 $emptyTelemetryResponse = [pscustomobject] @{
     tables = @(
         [pscustomobject] @{
@@ -585,5 +1623,430 @@ Assert-Throws `
     } `
     -ExpectedMessage 'ExpectedRenderImage must be the immutable Html2B Render digest.' `
     -Message 'Azure validator entry point did not delegate to the validation module.'
+
+$functionAuthorizationProbe = & $azureValidationModule {
+    param($SentinelFunctionKey)
+
+    $originalClockSkewGuard = $script:FunctionTelemetryClockSkewGuard
+    $script:FunctionTelemetryClockSkewGuard = [TimeSpan]::Zero
+    $script:AuthorizationProbeSentinel = $SentinelFunctionKey
+    $script:AuthorizationProbeFailKeyedContract = $false
+    $script:AuthorizationProbeImmediateReady = $false
+
+    function script:Get-AuthorizationProbeHeaderState {
+        param(
+            [Parameter(Mandatory)]
+            [System.Net.Http.HttpClient] $Client
+        )
+
+        if (-not $Client.DefaultRequestHeaders.Contains('x-functions-key')) {
+            return 'anonymous'
+        }
+
+        $headerValues = @(
+            $Client.DefaultRequestHeaders.GetValues('x-functions-key'))
+        if ($headerValues.Count -ne 1 -or
+            $headerValues[0] -cne $script:AuthorizationProbeSentinel) {
+            throw 'The Function authorization probe received an invalid key header.'
+        }
+
+        return 'keyed'
+    }
+
+    function script:New-ValidationHttpClient {
+        $handler = [Html2b.Tests.TrackingHandler]::new()
+        $client = [System.Net.Http.HttpClient]::new($handler)
+        $script:AuthorizationProbeHandlers.Add($handler)
+        $script:AuthorizationProbeClients.Add($client)
+        $script:AuthorizationProbeEvents.Add('client-created')
+        return $client
+    }
+
+    function script:Wait-EndpointStatus {
+        param(
+            [System.Net.Http.HttpClient] $Client,
+            [uri] $Uri,
+            [string] $ExpectedBodyStatus,
+            [TimeSpan] $Timeout
+        )
+
+        $headerState = Get-AuthorizationProbeHeaderState -Client $Client
+        $script:AuthorizationProbeEvents.Add(
+            "wait:$($Uri.AbsolutePath):$headerState")
+        return [ordered]@{
+            path = $Uri.AbsolutePath
+            httpStatus = 200
+            bodyStatus = $ExpectedBodyStatus
+            elapsedMilliseconds = 1
+        }
+    }
+
+    function script:Invoke-HealthContract {
+        param(
+            [System.Net.Http.HttpClient] $Client,
+            [uri] $Uri,
+            [string] $ExpectedBodyStatus,
+            [string] $Phase,
+            [string] $HostLabel,
+            [switch] $ReturnFailure
+        )
+
+        $headerState = Get-AuthorizationProbeHeaderState -Client $Client
+        $script:AuthorizationProbeEvents.Add(
+            "health:${Phase}:$headerState")
+        if ($Phase -eq 'keyed-cold-readiness' -and
+            -not $script:AuthorizationProbeImmediateReady) {
+            return [ordered]@{
+                host = $HostLabel
+                phase = $Phase
+                path = $Uri.AbsolutePath
+                httpStatus = 503
+                bodyStatus = 'not-ready'
+                elapsedMilliseconds = 2
+            }
+        }
+
+        return [ordered]@{
+            host = $HostLabel
+            phase = $Phase
+            path = $Uri.AbsolutePath
+            httpStatus = 200
+            bodyStatus = $ExpectedBodyStatus
+            elapsedMilliseconds = 1
+        }
+    }
+
+    function script:Invoke-ExpectedFunctionAuthorizationRejection {
+        param(
+            [System.Net.Http.HttpClient] $Client,
+            [uri] $Uri,
+            [string] $Method,
+            [string] $Scenario
+        )
+
+        $headerState = Get-AuthorizationProbeHeaderState -Client $Client
+        $script:AuthorizationProbeEvents.Add(
+            "reject:${Scenario}:$headerState")
+        return [ordered]@{
+            scenario = $Scenario
+            method = $Method
+            path = $Uri.AbsolutePath
+            httpStatus = 401
+        }
+    }
+
+    function script:Wait-RenderScaledToZero {
+        param(
+            [string] $Subscription,
+            [string] $ContainerAppResourceId,
+            [string] $RevisionName,
+            [TimeSpan] $Timeout
+        )
+
+        $script:AuthorizationProbeEvents.Add('scale-to-zero')
+        return 0.0
+    }
+
+    function script:Get-ExistingDefaultFunctionHostKey {
+        param(
+            [string] $Subscription,
+            [string] $GroupName,
+            [string] $AppName
+        )
+
+        $script:AuthorizationProbeEvents.Add('key-read')
+        return $script:AuthorizationProbeSentinel
+    }
+
+    function script:Invoke-FunctionContractValidation {
+        param(
+            [System.Net.Http.HttpClient] $Client,
+            [uri] $BaseUri,
+            [string] $Phase,
+            [switch] $SkipLiveness
+        )
+
+        $headerState = Get-AuthorizationProbeHeaderState -Client $Client
+        $script:AuthorizationProbeEvents.Add(
+            "function-contract:$headerState")
+        if (-not $SkipLiveness) {
+            throw 'The keyed Function probe unexpectedly included liveness.'
+        }
+        if ($script:AuthorizationProbeFailKeyedContract) {
+            throw 'Mock keyed Function contract failure.'
+        }
+
+        return @(
+            [ordered]@{
+                phase = $Phase
+                path = '/health/ready'
+                httpStatus = 200
+            },
+            [ordered]@{
+                phase = $Phase
+                path = '/api/renders/png'
+                httpStatus = 200
+            },
+            [ordered]@{
+                phase = $Phase
+                path = '/api/renders/jpeg'
+                httpStatus = 200
+            },
+            [ordered]@{
+                phase = $Phase
+                path = '/api/renders/pdf'
+                httpStatus = 200
+            })
+    }
+
+    function script:Invoke-RenderContract {
+        param(
+            [System.Net.Http.HttpClient] $Client,
+            [uri] $Uri,
+            [string] $Format,
+            [string] $Phase,
+            [string] $HostLabel
+        )
+
+        $headerState = Get-AuthorizationProbeHeaderState -Client $Client
+        $script:AuthorizationProbeEvents.Add(
+            "render:${Phase}:$headerState")
+        return [ordered]@{
+            host = $HostLabel
+            phase = $Phase
+            path = $Uri.AbsolutePath
+            format = $Format
+            httpStatus = 200
+        }
+    }
+
+    try {
+        $script:AuthorizationProbeEvents =
+            [System.Collections.Generic.List[string]]::new()
+        $script:AuthorizationProbeClients =
+            [System.Collections.Generic.List[
+                System.Net.Http.HttpClient]]::new()
+        $script:AuthorizationProbeHandlers =
+            [System.Collections.Generic.List[
+                Html2b.Tests.TrackingHandler]]::new()
+        $successResult = Invoke-FunctionAuthorizationValidation `
+            -Subscription 'subscription-id' `
+            -GroupName 'resource-group' `
+            -AppName 'func-html2b-api-dev' `
+            -BaseUri (
+                [uri] 'https://func-html2b-api-dev.azurewebsites.net/') `
+            -ContainerAppResourceId 'container-app-resource-id' `
+            -RevisionName 'revision-name'
+        $successEvents = @($script:AuthorizationProbeEvents)
+        $successClients = @($script:AuthorizationProbeClients)
+        $successHandlers = @($script:AuthorizationProbeHandlers)
+
+        $script:AuthorizationProbeEvents =
+            [System.Collections.Generic.List[string]]::new()
+        $script:AuthorizationProbeClients =
+            [System.Collections.Generic.List[
+                System.Net.Http.HttpClient]]::new()
+        $script:AuthorizationProbeHandlers =
+            [System.Collections.Generic.List[
+                Html2b.Tests.TrackingHandler]]::new()
+        $script:AuthorizationProbeImmediateReady = $true
+        $immediateReadyResult = Invoke-FunctionAuthorizationValidation `
+            -Subscription 'subscription-id' `
+            -GroupName 'resource-group' `
+            -AppName 'func-html2b-api-dev' `
+            -BaseUri (
+                [uri] 'https://func-html2b-api-dev.azurewebsites.net/') `
+            -ContainerAppResourceId 'container-app-resource-id' `
+            -RevisionName 'revision-name'
+        $immediateReadyEvents = @($script:AuthorizationProbeEvents)
+        $immediateReadyClients = @($script:AuthorizationProbeClients)
+        $immediateReadyHandlers = @($script:AuthorizationProbeHandlers)
+
+        $script:AuthorizationProbeEvents =
+            [System.Collections.Generic.List[string]]::new()
+        $script:AuthorizationProbeClients =
+            [System.Collections.Generic.List[
+                System.Net.Http.HttpClient]]::new()
+        $script:AuthorizationProbeHandlers =
+            [System.Collections.Generic.List[
+                Html2b.Tests.TrackingHandler]]::new()
+        $script:AuthorizationProbeFailKeyedContract = $true
+        $failureMessage = $null
+        try {
+            $null = Invoke-FunctionAuthorizationValidation `
+                -Subscription 'subscription-id' `
+                -GroupName 'resource-group' `
+                -AppName 'func-html2b-api-dev' `
+                -BaseUri (
+                    [uri] 'https://func-html2b-api-dev.azurewebsites.net/') `
+                -ContainerAppResourceId 'container-app-resource-id' `
+                -RevisionName 'revision-name'
+        }
+        catch {
+            $failureMessage = $_.Exception.Message
+        }
+        $failureClients = @($script:AuthorizationProbeClients)
+        $failureHandlers = @($script:AuthorizationProbeHandlers)
+
+        return [ordered]@{
+            successResult = $successResult
+            successEvents = $successEvents
+            successClientCount = $successClients.Count
+            successClientsDisposed =
+                @($successHandlers | Where-Object IsDisposed).Count
+            successKeyHeaderRemaining =
+                $successClients[1].DefaultRequestHeaders.Contains(
+                    'x-functions-key')
+            successSerialized = $successResult | ConvertTo-Json -Depth 20
+            immediateReadyResult = $immediateReadyResult
+            immediateReadyEvents = $immediateReadyEvents
+            immediateReadyClientCount = $immediateReadyClients.Count
+            immediateReadyClientsDisposed =
+                @($immediateReadyHandlers | Where-Object IsDisposed).Count
+            immediateReadyKeyHeaderRemaining =
+                $immediateReadyClients[1].DefaultRequestHeaders.Contains(
+                    'x-functions-key')
+            failureMessage = $failureMessage
+            failureClientCount = $failureClients.Count
+            failureClientsDisposed =
+                @($failureHandlers | Where-Object IsDisposed).Count
+            failureKeyHeaderRemaining =
+                $failureClients[1].DefaultRequestHeaders.Contains(
+                    'x-functions-key')
+        }
+    }
+    finally {
+        $script:FunctionTelemetryClockSkewGuard = $originalClockSkewGuard
+        $script:AuthorizationProbeSentinel = $null
+        Remove-Variable AuthorizationProbeFailKeyedContract `
+            -Scope Script `
+            -ErrorAction SilentlyContinue
+        Remove-Variable AuthorizationProbeImmediateReady `
+            -Scope Script `
+            -ErrorAction SilentlyContinue
+        Remove-Variable AuthorizationProbeEvents `
+            -Scope Script `
+            -ErrorAction SilentlyContinue
+        Remove-Variable AuthorizationProbeClients `
+            -Scope Script `
+            -ErrorAction SilentlyContinue
+        Remove-Variable AuthorizationProbeHandlers `
+            -Scope Script `
+            -ErrorAction SilentlyContinue
+    }
+} $sentinelFunctionKey
+Assert-Equal `
+    $functionAuthorizationProbe.successResult.contracts.Count `
+    11 `
+    'Function authorization orchestration contract count mismatch.'
+Assert-Equal `
+    $functionAuthorizationProbe.successResult.waits.Count `
+    2 `
+    'Function authorization orchestration wait count mismatch.'
+Assert-Equal `
+    ($functionAuthorizationProbe.successResult.coldWake.
+        firstReadinessAttemptRetried) `
+    $true `
+    'Function authorization orchestration did not exercise 503 convergence.'
+Assert-Equal `
+    $functionAuthorizationProbe.successClientCount `
+    2 `
+    'Function authorization orchestration did not isolate its HTTP clients.'
+Assert-Equal `
+    $functionAuthorizationProbe.successClientsDisposed `
+    2 `
+    'Function authorization orchestration did not dispose successful clients.'
+Assert-Equal `
+    $functionAuthorizationProbe.successKeyHeaderRemaining `
+    $false `
+    'Function authorization orchestration retained its successful key header.'
+Assert-Equal `
+    ($functionAuthorizationProbe.successSerialized -match
+        [regex]::Escape($sentinelFunctionKey)) `
+    $false `
+    'Function authorization orchestration serialized the Function host key.'
+Assert-Equal `
+    ($functionAuthorizationProbe.successSerialized -match 'x-functions-key') `
+    $false `
+    'Function authorization orchestration serialized a key header.'
+$lastNoKeyEventIndex = [Math]::Max(
+    [array]::IndexOf(
+        $functionAuthorizationProbe.successEvents,
+        'reject:ready-without-key:anonymous'),
+    [array]::IndexOf(
+        $functionAuthorizationProbe.successEvents,
+        'reject:render-without-key:anonymous'))
+$firstScaleToZeroIndex = [array]::IndexOf(
+    $functionAuthorizationProbe.successEvents,
+    'scale-to-zero')
+$keyReadIndex = [array]::IndexOf(
+    $functionAuthorizationProbe.successEvents,
+    'key-read')
+Assert-Equal `
+    ($keyReadIndex -gt $lastNoKeyEventIndex) `
+    $true `
+    'Function host key was read before no-key validation completed.'
+Assert-Equal `
+    ($keyReadIndex -gt $firstScaleToZeroIndex) `
+    $true `
+    'Function host key was read before the first cold boundary completed.'
+Assert-Equal `
+    (@(
+        $functionAuthorizationProbe.successEvents |
+            Where-Object { $_ -match ':keyed$' }).Count -gt 0) `
+    $true `
+    'Function authorization orchestration did not exercise keyed calls.'
+Assert-Equal `
+    ($functionAuthorizationProbe.successResult.noKeyWindow.endTime -lt
+        $functionAuthorizationProbe.successResult.keyedWindow.startTime) `
+    $true `
+    'Function authorization orchestration returned overlapping windows.'
+Assert-Equal `
+    $functionAuthorizationProbe.immediateReadyResult.contracts.Count `
+    11 `
+    'Immediate-ready Function authorization contract count mismatch.'
+Assert-Equal `
+    $functionAuthorizationProbe.immediateReadyResult.waits.Count `
+    1 `
+    'Immediate-ready Function authorization added a convergence wait.'
+Assert-Equal `
+    ($functionAuthorizationProbe.immediateReadyResult.coldWake.
+        firstReadinessAttemptRetried) `
+    $false `
+    'Immediate-ready Function authorization unexpectedly retried readiness.'
+Assert-Equal `
+    (@(
+        $functionAuthorizationProbe.immediateReadyEvents |
+            Where-Object { $_ -eq 'wait:/health/ready:keyed' }).Count) `
+    0 `
+    'Immediate-ready Function authorization ran the 503 convergence wait.'
+Assert-Equal `
+    $functionAuthorizationProbe.immediateReadyClientCount `
+    2 `
+    'Immediate-ready Function authorization did not isolate its clients.'
+Assert-Equal `
+    $functionAuthorizationProbe.immediateReadyClientsDisposed `
+    2 `
+    'Immediate-ready Function authorization did not dispose both clients.'
+Assert-Equal `
+    $functionAuthorizationProbe.immediateReadyKeyHeaderRemaining `
+    $false `
+    'Immediate-ready Function authorization retained its key header.'
+Assert-Equal `
+    $functionAuthorizationProbe.failureMessage `
+    'Mock keyed Function contract failure.' `
+    'Function authorization failure probe did not reach its keyed branch.'
+Assert-Equal `
+    $functionAuthorizationProbe.failureClientCount `
+    2 `
+    'Function authorization failure did not isolate its HTTP clients.'
+Assert-Equal `
+    $functionAuthorizationProbe.failureClientsDisposed `
+    2 `
+    'Function authorization failure did not dispose both clients.'
+Assert-Equal `
+    $functionAuthorizationProbe.failureKeyHeaderRemaining `
+    $false `
+    'Function authorization failure retained its key header.'
 
 Write-Host "$script:TestCount Azure validator offline tests passed."

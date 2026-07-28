@@ -22,7 +22,7 @@ public sealed class HealthFunctions(IRenderReadinessProbe readinessProbe)
     [Function("HealthReady")]
     public async Task<IActionResult> ReadyAsync(
         [HttpTrigger(
-            AuthorizationLevel.Anonymous,
+            AuthorizationLevel.Function,
             "get",
             Route = "health/ready")]
         HttpRequest request,
