@@ -1,39 +1,32 @@
-param location string
+targetScope = 'resourceGroup'
+
 param containerRegistryName string
+param containerRegistryResourceId string
 param imageRepositoryName string
 param deploymentOperatorPrincipalId string
-param baseTags object
 
 var repositoryWriterRoleDefinitionResourceId = subscriptionResourceId(
   'Microsoft.Authorization/roleDefinitions',
   '2a1e307c-b015-4ebd-883e-5b7698a07328'
 )
+// Feature 002 already created this principal/role/scope assignment for the
+// retired html2b-api publication path. Azure permits only one assignment for
+// that tuple, so retain its deterministic name while narrowing its condition
+// to the current html2b-render repository.
+var existingOperatorRepositoryName = 'html2b-api'
 var operatorRepositoryWriterCondition = '((!(ActionMatches{\'Microsoft.ContainerRegistry/registries/repositories/content/read\'}) AND !(ActionMatches{\'Microsoft.ContainerRegistry/registries/repositories/content/write\'}) AND !(ActionMatches{\'Microsoft.ContainerRegistry/registries/repositories/metadata/read\'}) AND !(ActionMatches{\'Microsoft.ContainerRegistry/registries/repositories/metadata/write\'})) OR (@Request[Microsoft.ContainerRegistry/registries/repositories:name] StringEqualsIgnoreCase \'${imageRepositoryName}\'))'
 
-resource containerRegistry 'Microsoft.ContainerRegistry/registries@2025-11-01' = {
+resource containerRegistry 'Microsoft.ContainerRegistry/registries@2025-11-01' existing = {
   name: containerRegistryName
-  location: location
-  tags: union(baseTags, {
-    Component: 'Registry'
-  })
-  sku: {
-    name: 'Basic'
-  }
-  properties: {
-    adminUserEnabled: false
-    anonymousPullEnabled: false
-    publicNetworkAccess: 'Enabled'
-    roleAssignmentMode: 'AbacRepositoryPermissions'
-    policies: {
-      azureADAuthenticationAsArmPolicy: {
-        status: 'enabled'
-      }
-    }
-  }
 }
 
-resource operatorRepositoryWriterRoleAssignment 'Microsoft.Authorization/roleAssignments@2022-04-01' = if (!empty(deploymentOperatorPrincipalId)) {
-  name: guid(containerRegistry.id, deploymentOperatorPrincipalId, repositoryWriterRoleDefinitionResourceId, imageRepositoryName)
+resource operatorRepositoryWriterRoleAssignment 'Microsoft.Authorization/roleAssignments@2022-04-01' = {
+  name: guid(
+    containerRegistryResourceId,
+    deploymentOperatorPrincipalId,
+    repositoryWriterRoleDefinitionResourceId,
+    existingOperatorRepositoryName
+  )
   scope: containerRegistry
   properties: {
     principalId: deploymentOperatorPrincipalId
@@ -41,10 +34,9 @@ resource operatorRepositoryWriterRoleAssignment 'Microsoft.Authorization/roleAss
     roleDefinitionId: repositoryWriterRoleDefinitionResourceId
     condition: operatorRepositoryWriterCondition
     conditionVersion: '2.0'
-    description: 'Write Html2B images only in the html2b-api repository.'
+    description: 'Write Html2B images only in the ${imageRepositoryName} repository.'
   }
 }
 
-output containerRegistryId string = containerRegistry.id
-output containerRegistryName string = containerRegistry.name
-output containerRegistryLoginServer string = containerRegistry.properties.loginServer
+output roleAssignmentId string = operatorRepositoryWriterRoleAssignment.id
+output roleDefinitionId string = repositoryWriterRoleDefinitionResourceId

@@ -1,3 +1,6 @@
+using Azure.Core;
+using Azure.Identity;
+
 using Html2b.Application.Rendering;
 using Html2b.Infrastructure.Rendering;
 
@@ -13,13 +16,18 @@ public static class DependencyInjection
         this IServiceCollection services,
         IConfiguration configuration)
     {
+        services.AddSingleton<
+            IValidateOptions<RenderServiceOptions>,
+            RenderServiceOptionsValidator>();
+
         services
             .AddOptions<RenderServiceOptions>()
             .Bind(configuration.GetSection(RenderServiceOptions.SectionName))
-            .Validate(
-                options => TryGetValidBaseUri(options.BaseUrl, out _),
-                $"{RenderServiceOptions.SectionName}:BaseUrl must be an absolute HTTP URI.")
             .ValidateOnStart();
+
+        services.AddSingleton<TokenCredential>(
+            new ManagedIdentityCredential(ManagedIdentityId.SystemAssigned));
+        services.AddTransient<RenderServiceAuthenticationHandler>();
 
         services.AddHttpClient<PocRenderHttpClient>(
             (provider, client) =>
@@ -28,10 +36,18 @@ public static class DependencyInjection
                     .GetRequiredService<IOptions<RenderServiceOptions>>()
                     .Value;
 
-                _ = TryGetValidBaseUri(options.BaseUrl, out var baseUri);
+                _ = RenderServiceOptionsValidator.TryGetBaseUri(
+                    options.BaseUrl,
+                    out var baseUri);
                 client.BaseAddress = baseUri;
                 client.Timeout = Timeout.InfiniteTimeSpan;
-            });
+            })
+            .ConfigurePrimaryHttpMessageHandler(
+                () => new SocketsHttpHandler
+                {
+                    AllowAutoRedirect = false,
+                })
+            .AddHttpMessageHandler<RenderServiceAuthenticationHandler>();
 
         services.AddTransient<IPocRenderGateway>(
             provider => provider.GetRequiredService<PocRenderHttpClient>());
@@ -39,17 +55,5 @@ public static class DependencyInjection
             provider => provider.GetRequiredService<PocRenderHttpClient>());
 
         return services;
-    }
-
-    private static bool TryGetValidBaseUri(string value, out Uri? uri)
-    {
-        if (Uri.TryCreate(value, UriKind.Absolute, out uri) &&
-            string.Equals(uri.Scheme, Uri.UriSchemeHttp, StringComparison.OrdinalIgnoreCase))
-        {
-            return true;
-        }
-
-        uri = null;
-        return false;
     }
 }

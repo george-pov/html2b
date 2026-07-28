@@ -5,4 +5,5 @@
   <Project Path="Html2b.Domain/Html2b.Domain.csproj" />
   <Project Path="Html2b.Infrastructure/Html2b.Infrastructure.csproj" />
   <Project Path="Html2b.Render/Html2b.Render.csproj" />
+  <Project Path="Test/Html2b.Infrastructure.Tests/Html2b.Infrastructure.Tests.csproj" />
 </Solution>

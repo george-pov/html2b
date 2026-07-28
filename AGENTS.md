@@ -1,36 +1,62 @@
-# Repository Guidelines
+# AI Agent Instructions
 
-## Project Structure & Module Organization
+## Read Before Acting
 
-This repository is currently an early-stage .NET scaffold: only `.gitignore` is tracked, and no solution, source project, or test project has been added. Keep the root focused on solution-level files such as `html2b.sln`, `README.md`, and shared configuration. Place production projects under `src/` and matching test projects under `tests/`, for example:
+- Start with `README.md`, then read every durable document relevant to the
+  requested area.
+- Inspect the implementation, configuration, and runtime entry points before
+  relying on documentation. When they disagree, report the mismatch and keep
+  any authorized documentation change aligned with the implemented behavior.
+- Discover solution, project, test, and command paths from the repository
+  instead of assuming conventional names or locations.
 
-```text
-src/Html2B/Html2B.csproj
-tests/Html2B.Tests/Html2B.Tests.csproj
-```
+## Documentation Ownership
 
-Store project-owned assets beside the project that consumes them. Avoid committing generated `bin/`, `obj/`, `artifacts/`, coverage, or test-result directories; these are already ignored.
+- Keep `README.md` as a concise human-facing documentation index.
+- Keep durable documents under `docs/` human-facing, present-tense, and limited
+  to implemented behavior.
+- Never place AI instructions in `README.md` or `docs/`.
+- Never add a reference to `AGENTS.md` from `README.md` or `docs/`.
+- Do not duplicate durable technical facts in this file. Point agents to the
+  owning human document instead.
+- Keep plans, roadmaps, feature phases, approval records, implementation
+  history, review evidence, and validation evidence under `.work/`.
+- Do not mention `.work/` in `README.md` or durable documents.
 
-## Build, Test, and Development Commands
+## Work Boundaries
 
-No build scripts or project files exist yet. After the solution is created, use standard .NET CLI commands from the repository root:
+- Follow the user's requested scope literally. A request for analysis, review,
+  diagnosis, planning, or documentation does not authorize unrelated code or
+  infrastructure changes.
+- Preserve unrelated user changes and inspect overlapping edits before
+  modifying a file.
+- Do not perform live Azure mutations unless the user explicitly authorizes
+  them.
 
-- `dotnet restore` — restore NuGet dependencies.
-- `dotnet build --configuration Release` — compile the full solution with release settings.
-- `dotnet test --configuration Release` — run all tests in the solution.
-- `dotnet run --project src/Html2B` — run the main project locally (adjust the path if the project name changes).
-- `dotnet format` — apply configured .NET formatting rules before review.
+## Local AI Workflows
 
-Update this section when repository-specific scripts or commands are introduced.
+- When `.work/agents/` exists, read the relevant workflow files before
+  planning, implementation, review, validation, or release work.
+- Treat `.work/` as local workflow state. Verify ignored records with direct
+  path checks and readback rather than relying on Git status.
 
-## Coding Style & Naming Conventions
+## Documentation Rules
 
-Use four spaces for C# indentation and follow standard .NET naming: `PascalCase` for types, public members, and namespaces; `camelCase` for parameters and local variables; and `IName` for interfaces. Enable nullable reference types and implicit usings in new projects. Prefer one primary type per file, with the filename matching the type. Add an `.editorconfig` when the first project is created and treat formatter or analyzer warnings as issues to resolve.
+- Describe the system as it operates now. Do not include proof-of-concept,
+  transition, target-state, roadmap, feature-phase, or historical release
+  language in `README.md` or `docs/`.
+- Do not document unimplemented templates, assets, persistence, queues, user
+  interfaces, or asynchronous jobs as available behavior.
+- Keep the Azure deployment guide free of secrets and specific identifiers,
+  hostnames, resource names, release hashes, image digest values,
+  environment-specific values, and Bicep symbol names.
+- Keep detailed setup, API, architecture, and deployment information in their
+  owning durable documents rather than repeating it in `README.md`.
 
-## Testing Guidelines
+## Validation
 
-Create a dedicated test project under `tests/` for each production project. Name test files after the subject, such as `HtmlConverterTests.cs`, and test methods by behavior, such as `Convert_EmptyInput_ReturnsEmptyOutput`. Add regression tests with bug fixes. No coverage threshold is currently defined; prioritize meaningful coverage of parsing, conversion, and error paths.
-
-## Commit & Pull Request Guidelines
-
-Git history currently contains only `Initial commit`, so no established message convention exists. Use short, imperative subjects such as `Add HTML conversion pipeline`, and keep each commit focused. Pull requests should explain the change and validation performed, link related issues, and include sample input/output or screenshots when behavior or rendered output changes. Keep secrets out of commits; `.env` is ignored for local configuration.
+- Validate in proportion to the change and use repository-defined commands
+  where they exist.
+- For documentation changes, verify internal Markdown links, scan for forbidden
+  ownership and state-language terms, and run `git diff --check`.
+- Report checks that were skipped or could not run.
