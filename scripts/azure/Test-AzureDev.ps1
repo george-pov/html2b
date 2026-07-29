@@ -2,20 +2,27 @@
 param(
     [Parameter(Mandatory)]
     [ValidateNotNullOrEmpty()]
+    [string] $EnvironmentName,
+
+    [Parameter(Mandatory)]
+    [ValidateNotNullOrEmpty()]
     [string] $SubscriptionId,
 
     [Parameter(Mandatory)]
     [ValidateNotNullOrEmpty()]
     [string] $ExpectedTenantId,
 
+    [Parameter(Mandatory)]
     [ValidateNotNullOrEmpty()]
-    [string] $ResourceGroupName = 'rg-html2b-dev',
+    [string] $ResourceGroupName,
 
+    [Parameter(Mandatory)]
     [ValidateNotNullOrEmpty()]
-    [string] $FunctionAppName = 'func-html2b-api-dev',
+    [string] $FunctionAppName,
 
+    [Parameter(Mandatory)]
     [ValidateNotNullOrEmpty()]
-    [string] $RenderContainerAppName = 'ca-html2b-render-dev',
+    [string] $RenderContainerAppName,
 
     [Parameter(Mandatory)]
     [ValidateNotNullOrEmpty()]
@@ -23,10 +30,55 @@ param(
 
     [Parameter(Mandatory)]
     [ValidateNotNullOrEmpty()]
+    [string] $RenderRegistryServer,
+
+    [Parameter(Mandatory)]
+    [ValidateNotNullOrEmpty()]
+    [string] $RenderImageRepository,
+
+    [Parameter(Mandatory)]
+    [ValidateNotNullOrEmpty()]
+    [string] $RenderIdentityName,
+
+    [Parameter(Mandatory)]
+    [ValidateNotNullOrEmpty()]
     [string] $ExpectedRenderImage,
 
+    [Parameter(Mandatory)]
     [ValidateNotNullOrEmpty()]
-    [string] $ApplicationInsightsName = 'appi-html2b-dev',
+    [string] $ApplicationInsightsName,
+
+    [Parameter(Mandatory)]
+    [ValidateRange(1, [int]::MaxValue)]
+    [int] $FunctionInstanceMemoryMB,
+
+    [Parameter(Mandatory)]
+    [ValidateRange(1, [int]::MaxValue)]
+    [int] $FunctionMaximumInstanceCount,
+
+    [Parameter(Mandatory)]
+    [ValidateScript({ $_ -gt 0 })]
+    [double] $RenderCpu,
+
+    [Parameter(Mandatory)]
+    [ValidateNotNullOrEmpty()]
+    [string] $RenderMemory,
+
+    [Parameter(Mandatory)]
+    [ValidateRange(0, [int]::MaxValue)]
+    [int] $RenderMinReplicas,
+
+    [Parameter(Mandatory)]
+    [ValidateRange(1, [int]::MaxValue)]
+    [int] $RenderMaxReplicas,
+
+    [Parameter(Mandatory)]
+    [ValidateRange(1, [int]::MaxValue)]
+    [int] $RenderHttpConcurrency,
+
+    [Parameter(Mandatory)]
+    [ValidateNotNullOrEmpty()]
+    [string] $OutputDirectory,
 
     [ValidateSet('default')]
     [string] $FunctionHostKeyName = 'default',

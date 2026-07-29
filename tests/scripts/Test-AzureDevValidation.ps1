@@ -68,6 +68,208 @@ function Assert-Throws {
     $script:TestCount++
 }
 
+function New-TestFunctionState {
+    param(
+        [Parameter(Mandatory)]
+        [string] $Name,
+
+        [Parameter(Mandatory)]
+        [string] $TenantId,
+
+        [Parameter(Mandatory)]
+        [string] $PrincipalId,
+
+        [Parameter(Mandatory)]
+        [int] $InstanceMemoryMB,
+
+        [Parameter(Mandatory)]
+        [int] $MaximumInstanceCount
+    )
+
+    return [pscustomobject]@{
+        name = $Name
+        kind = 'functionapp,linux'
+        identity = [pscustomobject]@{
+            type = 'SystemAssigned'
+            principalId = $PrincipalId
+            tenantId = $TenantId
+        }
+        properties = [pscustomobject]@{
+            state = 'Running'
+            enabled = $true
+            httpsOnly = $true
+            publicNetworkAccess = 'Enabled'
+            defaultHostName = "$Name.azurewebsites.net"
+            functionAppConfig = [pscustomobject]@{
+                runtime = [pscustomobject]@{
+                    name = 'dotnet-isolated'
+                    version = '10.0'
+                }
+                scaleAndConcurrency = [pscustomobject]@{
+                    instanceMemoryMB = $InstanceMemoryMB
+                    maximumInstanceCount = $MaximumInstanceCount
+                }
+            }
+        }
+    }
+}
+
+function New-TestRenderProbe {
+    param(
+        [Parameter(Mandatory)]
+        [string] $Type,
+
+        [Parameter(Mandatory)]
+        [string] $Path,
+
+        [Parameter(Mandatory)]
+        [int] $InitialDelaySeconds,
+
+        [Parameter(Mandatory)]
+        [int] $PeriodSeconds,
+
+        [Parameter(Mandatory)]
+        [int] $FailureThreshold
+    )
+
+    return [pscustomobject]@{
+        type = $Type
+        httpGet = [pscustomobject]@{
+            path = $Path
+            port = 8080
+            scheme = 'HTTP'
+        }
+        initialDelaySeconds = $InitialDelaySeconds
+        periodSeconds = $PeriodSeconds
+        timeoutSeconds = 5
+        failureThreshold = $FailureThreshold
+        successThreshold = 1
+    }
+}
+
+function New-TestRenderState {
+    param(
+        [Parameter(Mandatory)]
+        [string] $Name,
+
+        [Parameter(Mandatory)]
+        [string] $RegistryServer,
+
+        [Parameter(Mandatory)]
+        [string] $IdentityId,
+
+        [Parameter(Mandatory)]
+        [string] $Image,
+
+        [Parameter(Mandatory)]
+        [double] $Cpu,
+
+        [Parameter(Mandatory)]
+        [string] $Memory,
+
+        [Parameter(Mandatory)]
+        [int] $MinReplicas,
+
+        [Parameter(Mandatory)]
+        [int] $MaxReplicas,
+
+        [Parameter(Mandatory)]
+        [int] $HttpConcurrency
+    )
+
+    $identityProperties = [ordered]@{}
+    $identityProperties[$IdentityId] = [ordered]@{}
+
+    return [pscustomobject]@{
+        name = $Name
+        identity = [pscustomobject]@{
+            type = 'UserAssigned'
+            userAssignedIdentities = [pscustomobject] $identityProperties
+        }
+        properties = [pscustomobject]@{
+            provisioningState = 'Succeeded'
+            runningStatus = 'Running'
+            latestRevisionName = "$Name--revision"
+            latestReadyRevisionName = "$Name--revision"
+            configuration = [pscustomobject]@{
+                activeRevisionsMode = 'Single'
+                maxInactiveRevisions = 100
+                ingress = [pscustomobject]@{
+                    external = $true
+                    allowInsecure = $false
+                    targetPort = 8080
+                    transport = 'auto'
+                    fqdn = "$Name.example"
+                }
+                registries = @(
+                    [pscustomobject]@{
+                        server = $RegistryServer
+                        identity = $IdentityId
+                    }
+                )
+                identitySettings = @(
+                    [pscustomobject]@{
+                        identity = $IdentityId
+                        lifecycle = 'None'
+                    }
+                )
+                secrets = @()
+            }
+            template = [pscustomobject]@{
+                containers = @(
+                    [pscustomobject]@{
+                        name = 'html2b-render'
+                        image = $Image
+                        resources = [pscustomobject]@{
+                            cpu = $Cpu
+                            memory = $Memory
+                        }
+                        env = @()
+                        probes = @(
+                            New-TestRenderProbe `
+                                -Type 'Startup' `
+                                -Path '/health/ready' `
+                                -InitialDelaySeconds 1 `
+                                -PeriodSeconds 5 `
+                                -FailureThreshold 10
+                            New-TestRenderProbe `
+                                -Type 'Liveness' `
+                                -Path '/health/live' `
+                                -InitialDelaySeconds 10 `
+                                -PeriodSeconds 30 `
+                                -FailureThreshold 3
+                            New-TestRenderProbe `
+                                -Type 'Readiness' `
+                                -Path '/health/ready' `
+                                -InitialDelaySeconds 1 `
+                                -PeriodSeconds 5 `
+                                -FailureThreshold 3
+                        )
+                    }
+                )
+                terminationGracePeriodSeconds = 30
+                scale = [pscustomobject]@{
+                    minReplicas = $MinReplicas
+                    maxReplicas = $MaxReplicas
+                    pollingInterval = 30
+                    cooldownPeriod = 300
+                    rules = @(
+                        [pscustomobject]@{
+                            name = 'http-one-render'
+                            http = [pscustomobject]@{
+                                metadata = [pscustomobject]@{
+                                    concurrentRequests =
+                                        [string] $HttpConcurrency
+                                }
+                            }
+                        }
+                    )
+                }
+            }
+        }
+    }
+}
+
 $azureValidationModule = Get-Module Html2b.AzureDevValidation
 $azureValidationModuleAst =
     $azureValidationModule.SessionState.InvokeCommand.
@@ -180,6 +382,124 @@ Assert-Equal `
     $orchestrationKeyParameterAst[0].DefaultValue.Value `
     'default' `
     'Azure validation orchestration key-name default mismatch.'
+
+$requiredEnvironmentParameterNames = @(
+    'EnvironmentName'
+    'SubscriptionId'
+    'ExpectedTenantId'
+    'ResourceGroupName'
+    'FunctionAppName'
+    'RenderContainerAppName'
+    'RenderApiClientId'
+    'RenderRegistryServer'
+    'RenderImageRepository'
+    'RenderIdentityName'
+    'ExpectedRenderImage'
+    'ApplicationInsightsName'
+    'FunctionInstanceMemoryMB'
+    'FunctionMaximumInstanceCount'
+    'RenderCpu'
+    'RenderMemory'
+    'RenderMinReplicas'
+    'RenderMaxReplicas'
+    'RenderHttpConcurrency'
+    'OutputDirectory'
+)
+foreach ($parameterName in $requiredEnvironmentParameterNames) {
+    foreach ($command in @($entryCommand, $orchestrationCommand)) {
+        $parameter = $command.Parameters[$parameterName]
+        Assert-Equal `
+            ($null -ne $parameter) `
+            $true `
+            "$($command.Name) is missing parameter $parameterName."
+        $parameterAttributes = @(
+            $parameter.Attributes |
+                Where-Object {
+                    $_ -is [System.Management.Automation.ParameterAttribute]
+                }
+        )
+        Assert-Equal `
+            $parameterAttributes[0].Mandatory `
+            $true `
+            "$($command.Name) parameter $parameterName is not mandatory."
+    }
+}
+
+$azureValidationSource = Get-Content `
+    -LiteralPath (Join-Path $azureScripts 'Html2b.AzureDevValidation.psm1') `
+    -Raw
+foreach ($retiredLiteral in @(
+        'crhtml2bdev.azurecr.io',
+        'id-html2b-render-dev',
+        'build\validation\005',
+        "'P03'",
+        'anonymous-p03')) {
+    Assert-Equal `
+        $azureValidationSource.Contains($retiredLiteral) `
+        $false `
+        "Azure validation retained environment-specific literal $retiredLiteral."
+}
+
+$applicationWorkflowPath = Join-Path `
+    $repositoryRoot `
+    '.github/workflows/daploy-azure.yml'
+$infrastructureWorkflowPath = Join-Path `
+    $repositoryRoot `
+    '.github/workflows/deploy-azure-infrastructure.yml'
+$applicationWorkflow = Get-Content `
+    -LiteralPath $applicationWorkflowPath `
+    -Raw
+$infrastructureWorkflow = Get-Content `
+    -LiteralPath $infrastructureWorkflowPath `
+    -Raw
+Assert-Equal `
+    ($applicationWorkflow -match "'\s*\$\{\{\s*vars\.") `
+    $false `
+    'Application workflow interpolates an Environment value into PowerShell source.'
+
+$workflowParameterBindings = [ordered]@{
+    EnvironmentName = 'TARGET_ENVIRONMENT'
+    SubscriptionId = 'AZURE_SUBSCRIPTION_ID'
+    ExpectedTenantId = 'AZURE_TENANT_ID'
+    ResourceGroupName = 'AZURE_RESOURCE_GROUP_NAME'
+    FunctionAppName = 'AZURE_FUNCTION_APP_NAME'
+    RenderContainerAppName = 'AZURE_RENDER_CONTAINER_APP_NAME'
+    RenderApiClientId = 'AZURE_RENDER_API_CLIENT_ID'
+    RenderRegistryServer = 'AZURE_RENDER_REGISTRY_SERVER'
+    RenderImageRepository = 'AZURE_RENDER_IMAGE_REPOSITORY'
+    RenderIdentityName = 'AZURE_RENDER_IDENTITY_NAME'
+    ExpectedRenderImage = 'RENDER_IMAGE'
+    ApplicationInsightsName = 'AZURE_APPLICATION_INSIGHTS_NAME'
+    FunctionInstanceMemoryMB = 'AZURE_FUNCTION_INSTANCE_MEMORY_MB'
+    FunctionMaximumInstanceCount =
+        'AZURE_FUNCTION_MAXIMUM_INSTANCE_COUNT'
+    RenderCpu = 'AZURE_RENDER_CPU'
+    RenderMemory = 'AZURE_RENDER_MEMORY'
+    RenderMinReplicas = 'AZURE_RENDER_MIN_REPLICAS'
+    RenderMaxReplicas = 'AZURE_RENDER_MAX_REPLICAS'
+    RenderHttpConcurrency = 'AZURE_RENDER_HTTP_CONCURRENCY'
+}
+foreach ($workflow in @(
+        [pscustomobject]@{
+            name = 'application'
+            content = $applicationWorkflow
+        },
+        [pscustomobject]@{
+            name = 'infrastructure'
+            content = $infrastructureWorkflow
+        })) {
+    foreach ($binding in $workflowParameterBindings.GetEnumerator()) {
+        $argument = "-$($binding.Key) `$env:$($binding.Value)"
+        Assert-Equal `
+            $workflow.content.Contains($argument) `
+            $true `
+            "$($workflow.name) workflow does not explicitly pass $($binding.Key)."
+    }
+    Assert-Equal `
+        $workflow.content.Contains('-OutputDirectory') `
+        $true `
+        "$($workflow.name) workflow does not pass a validation output directory."
+}
 
 $functionAuthorizationCommand = & $azureValidationModule {
     Get-Command Invoke-FunctionAuthorizationValidation
@@ -463,13 +783,13 @@ $httpRequestSource = Get-Content `
 Assert-Equal `
     ([regex]::Matches(
         $httpRequestSource,
-        '(?m)^@Html2b\.AzureFunctions_FunctionKey = <function-key>$').Count) `
+        '(?m)^@Html2b\.AzureFunctions_FunctionKey = <function-key>\r?$').Count) `
     1 `
     'Function request samples do not declare the exact key placeholder once.'
 Assert-Equal `
     ([regex]::Matches(
         $httpRequestSource,
-        '(?m)^x-functions-key: \{\{Html2b\.AzureFunctions_FunctionKey\}\}$').Count) `
+        '(?m)^x-functions-key: \{\{Html2b\.AzureFunctions_FunctionKey\}\}\r?$').Count) `
     5 `
     'Function request samples do not have the expected placeholder headers.'
 $httpRequestBlocks = @(
@@ -504,7 +824,7 @@ foreach ($keyedPath in @(
     Assert-Equal `
         ([regex]::Matches(
             $keyedRequestBlock[0],
-            '(?m)^x-functions-key: \{\{Html2b\.AzureFunctions_FunctionKey\}\}$').Count) `
+            '(?m)^x-functions-key: \{\{Html2b\.AzureFunctions_FunctionKey\}\}\r?$').Count) `
         1 `
         "Function request sample $keyedPath does not send the placeholder key."
 }
@@ -586,6 +906,323 @@ Assert-Throws `
 $tenantId = '11111111-1111-1111-1111-111111111111'
 $clientId = '22222222-2222-2222-2222-222222222222'
 $principalId = '33333333-3333-3333-3333-333333333333'
+
+$environmentContracts = @(
+    [pscustomobject]@{
+        environment = 'dev'
+        resourceGroup = 'rg-render-dev'
+        functionName = 'func-render-dev'
+        renderName = 'ca-render-dev'
+        registryServer = 'registry.dev.azurecr.io'
+        imageRepository = 'team/render.v1'
+        identityName = 'id-render-dev'
+        digestCharacter = 'a'
+        functionMemory = 2048
+        functionMaximumInstances = 1
+        renderCpu = 1.0
+        renderMemory = '2Gi'
+        renderMinReplicas = 0
+        renderMaxReplicas = 1
+        renderHttpConcurrency = 1
+    },
+    [pscustomobject]@{
+        environment = 'staging'
+        resourceGroup = 'rg-render-staging'
+        functionName = 'func-render-staging'
+        renderName = 'ca-render-staging'
+        registryServer = 'registry.staging.azurecr.io'
+        imageRepository = 'products/render.v2'
+        identityName = 'id-render-staging'
+        digestCharacter = 'b'
+        functionMemory = 4096
+        functionMaximumInstances = 4
+        renderCpu = 0.5
+        renderMemory = '1Gi'
+        renderMinReplicas = 0
+        renderMaxReplicas = 3
+        renderHttpConcurrency = 2
+    }
+)
+
+foreach ($contract in $environmentContracts) {
+    $identityId = Get-ExpectedRenderIdentityId `
+        -SubscriptionId $tenantId `
+        -ResourceGroupName $contract.resourceGroup `
+        -RenderIdentityName $contract.identityName
+    $image =
+        "$($contract.registryServer)/$($contract.imageRepository)" +
+        "@sha256:$($contract.digestCharacter * 64)"
+    $imageAccepted = & $azureValidationModule {
+        param($Image, $RegistryServer, $ImageRepository)
+
+        Assert-ImmutableRenderImageReference `
+            -Image $Image `
+            -RegistryServer $RegistryServer `
+            -ImageRepository $ImageRepository
+        return $true
+    } $image $contract.registryServer $contract.imageRepository
+    Assert-Equal `
+        $imageAccepted `
+        $true `
+        "Immutable image validation rejected $($contract.environment)."
+
+    $renderUrl = "https://$($contract.renderName).example"
+    $functionState = New-TestFunctionState `
+        -Name $contract.functionName `
+        -TenantId $tenantId `
+        -PrincipalId $principalId `
+        -InstanceMemoryMB $contract.functionMemory `
+        -MaximumInstanceCount $contract.functionMaximumInstances
+    $functionSettings = @(
+        [pscustomobject]@{
+            name = 'RenderService__BaseUrl'
+            value = $renderUrl
+        },
+        [pscustomobject]@{
+            name = 'RenderService__Audience'
+            value = "api://$clientId"
+        }
+    )
+    $functionResult = Assert-FunctionConfiguration `
+        -State $functionState `
+        -Settings $functionSettings `
+        -ExpectedTenant $tenantId `
+        -ExpectedRenderUrl $renderUrl `
+        -ExpectedAudience "api://$clientId" `
+        -ExpectedInstanceMemoryMB $contract.functionMemory `
+        -ExpectedMaximumInstanceCount (
+            $contract.functionMaximumInstances)
+    Assert-Equal `
+        $functionResult.scale.instanceMemoryMB `
+        $contract.functionMemory `
+        "Function memory mismatch for $($contract.environment)."
+    Assert-Equal `
+        $functionResult.scale.maximumInstanceCount `
+        $contract.functionMaximumInstances `
+        "Function instance cap mismatch for $($contract.environment)."
+
+    $renderState = New-TestRenderState `
+        -Name $contract.renderName `
+        -RegistryServer $contract.registryServer `
+        -IdentityId $identityId `
+        -Image $image `
+        -Cpu $contract.renderCpu `
+        -Memory $contract.renderMemory `
+        -MinReplicas $contract.renderMinReplicas `
+        -MaxReplicas $contract.renderMaxReplicas `
+        -HttpConcurrency $contract.renderHttpConcurrency
+    $renderResult = Assert-RenderContainerConfiguration `
+        -State $renderState `
+        -ExpectedImage $image `
+        -ExpectedIdentityId $identityId `
+        -ExpectedRegistryServer $contract.registryServer `
+        -ExpectedCpu $contract.renderCpu `
+        -ExpectedMemory $contract.renderMemory `
+        -ExpectedMinReplicas $contract.renderMinReplicas `
+        -ExpectedMaxReplicas $contract.renderMaxReplicas `
+        -ExpectedHttpConcurrency $contract.renderHttpConcurrency
+    Assert-Equal `
+        $renderResult.registryServer `
+        $contract.registryServer `
+        "Render registry mismatch for $($contract.environment)."
+    Assert-Equal `
+        $renderResult.scale.maxReplicas `
+        $contract.renderMaxReplicas `
+        "Render replica cap mismatch for $($contract.environment)."
+}
+
+$driftContract = $environmentContracts[0]
+$driftIdentityId = Get-ExpectedRenderIdentityId `
+    -SubscriptionId $tenantId `
+    -ResourceGroupName $driftContract.resourceGroup `
+    -RenderIdentityName $driftContract.identityName
+$driftImage =
+    "$($driftContract.registryServer)/$($driftContract.imageRepository)" +
+    "@sha256:$($driftContract.digestCharacter * 64)"
+$functionScaleDriftState = New-TestFunctionState `
+    -Name $driftContract.functionName `
+    -TenantId $tenantId `
+    -PrincipalId $principalId `
+    -InstanceMemoryMB ($driftContract.functionMemory + 1) `
+    -MaximumInstanceCount $driftContract.functionMaximumInstances
+$driftFunctionSettings = @(
+    [pscustomobject]@{
+        name = 'RenderService__BaseUrl'
+        value = "https://$($driftContract.renderName).example"
+    },
+    [pscustomobject]@{
+        name = 'RenderService__Audience'
+        value = "api://$clientId"
+    }
+)
+Assert-Throws `
+    -Action {
+        Assert-FunctionConfiguration `
+            -State $functionScaleDriftState `
+            -Settings $driftFunctionSettings `
+            -ExpectedTenant $tenantId `
+            -ExpectedRenderUrl (
+                "https://$($driftContract.renderName).example") `
+            -ExpectedAudience "api://$clientId" `
+            -ExpectedInstanceMemoryMB $driftContract.functionMemory `
+            -ExpectedMaximumInstanceCount (
+                $driftContract.functionMaximumInstances)
+    } `
+    -ExpectedMessage `
+        'The Function App scale contract does not match the selected Environment.' `
+    -Message 'Function scale validation accepted Environment drift.'
+
+$renderScaleDriftState = New-TestRenderState `
+    -Name $driftContract.renderName `
+    -RegistryServer $driftContract.registryServer `
+    -IdentityId $driftIdentityId `
+    -Image $driftImage `
+    -Cpu $driftContract.renderCpu `
+    -Memory $driftContract.renderMemory `
+    -MinReplicas $driftContract.renderMinReplicas `
+    -MaxReplicas ($driftContract.renderMaxReplicas + 1) `
+    -HttpConcurrency $driftContract.renderHttpConcurrency
+Assert-Throws `
+    -Action {
+        Assert-RenderContainerConfiguration `
+            -State $renderScaleDriftState `
+            -ExpectedImage $driftImage `
+            -ExpectedIdentityId $driftIdentityId `
+            -ExpectedRegistryServer $driftContract.registryServer `
+            -ExpectedCpu $driftContract.renderCpu `
+            -ExpectedMemory $driftContract.renderMemory `
+            -ExpectedMinReplicas $driftContract.renderMinReplicas `
+            -ExpectedMaxReplicas $driftContract.renderMaxReplicas `
+            -ExpectedHttpConcurrency (
+                $driftContract.renderHttpConcurrency)
+    } `
+    -ExpectedMessage 'Render scale timing or replica limits have drifted.' `
+    -Message 'Render scale validation accepted Environment drift.'
+
+$renderIdentityDriftState = New-TestRenderState `
+    -Name $driftContract.renderName `
+    -RegistryServer $driftContract.registryServer `
+    -IdentityId $driftIdentityId `
+    -Image $driftImage `
+    -Cpu $driftContract.renderCpu `
+    -Memory $driftContract.renderMemory `
+    -MinReplicas $driftContract.renderMinReplicas `
+    -MaxReplicas $driftContract.renderMaxReplicas `
+    -HttpConcurrency $driftContract.renderHttpConcurrency
+$otherIdentityId = Get-ExpectedRenderIdentityId `
+    -SubscriptionId $tenantId `
+    -ResourceGroupName $driftContract.resourceGroup `
+    -RenderIdentityName 'id-render-other'
+Assert-Throws `
+    -Action {
+        Assert-RenderContainerConfiguration `
+            -State $renderIdentityDriftState `
+            -ExpectedImage $driftImage `
+            -ExpectedIdentityId $otherIdentityId `
+            -ExpectedRegistryServer $driftContract.registryServer `
+            -ExpectedCpu $driftContract.renderCpu `
+            -ExpectedMemory $driftContract.renderMemory `
+            -ExpectedMinReplicas $driftContract.renderMinReplicas `
+            -ExpectedMaxReplicas $driftContract.renderMaxReplicas `
+            -ExpectedHttpConcurrency (
+                $driftContract.renderHttpConcurrency)
+    } `
+    -ExpectedMessage 'Render does not have exactly the selected identity.' `
+    -Message 'Render identity validation accepted Environment drift.'
+
+$escapedRegistryServer = 'registry.example.azurecr.io'
+$escapedImageRepository = 'team/render.v2'
+foreach ($invalidImage in @(
+        "registryXexample.azurecr.io/$escapedImageRepository" +
+            "@sha256:$('c' * 64)",
+        "$escapedRegistryServer/team/renderXv2@sha256:$('c' * 64)",
+        "$escapedRegistryServer/$escapedImageRepository:latest",
+        "$escapedRegistryServer/$escapedImageRepository@sha256:$('C' * 64)")) {
+    Assert-Throws `
+        -Action {
+            & $azureValidationModule {
+                param($Image, $RegistryServer, $ImageRepository)
+
+                Assert-ImmutableRenderImageReference `
+                    -Image $Image `
+                    -RegistryServer $RegistryServer `
+                    -ImageRepository $ImageRepository
+            } `
+                $invalidImage `
+                $escapedRegistryServer `
+                $escapedImageRepository
+        } `
+        -ExpectedMessage (
+            'ExpectedRenderImage must use the selected registry and ' +
+            'repository with an immutable lowercase sha256 digest.') `
+        -Message "Immutable image validation accepted '$invalidImage'."
+}
+
+$containedOutput = & $azureValidationModule {
+    param($RepositoryRoot, $OutputDirectory)
+
+    Resolve-AzureValidationOutputDirectory `
+        -RepositoryRoot $RepositoryRoot `
+        -OutputDirectory $OutputDirectory
+} `
+    $repositoryRoot `
+    'build/validation/staging/live'
+Assert-Equal `
+    $containedOutput `
+    ([System.IO.Path]::GetFullPath(
+        'build/validation/staging/live',
+        $repositoryRoot)) `
+    'Validation output containment changed an accepted path.'
+foreach ($unsafeOutput in @(
+        'build/validation/../outside',
+        'build/validation-results/live')) {
+    Assert-Throws `
+        -Action {
+            & $azureValidationModule {
+                param($RepositoryRoot, $OutputDirectory)
+
+                Resolve-AzureValidationOutputDirectory `
+                    -RepositoryRoot $RepositoryRoot `
+                    -OutputDirectory $OutputDirectory
+            } $repositoryRoot $unsafeOutput
+        } `
+        -ExpectedMessage `
+            'Validation output must remain below the repository build/validation directory.' `
+        -Message "Validation output containment accepted '$unsafeOutput'."
+}
+
+$caseMismatchedOutput = 'build/VALIDATION/staging/live'
+if ([System.OperatingSystem]::IsWindows()) {
+    $caseMismatchedResult = & $azureValidationModule {
+        param($RepositoryRoot, $OutputDirectory)
+
+        Resolve-AzureValidationOutputDirectory `
+            -RepositoryRoot $RepositoryRoot `
+            -OutputDirectory $OutputDirectory
+    } $repositoryRoot $caseMismatchedOutput
+    Assert-Equal `
+        $caseMismatchedResult `
+        ([System.IO.Path]::GetFullPath(
+            $caseMismatchedOutput,
+            $repositoryRoot)) `
+        'Windows validation containment rejected a case-equivalent path.'
+}
+else {
+    Assert-Throws `
+        -Action {
+            & $azureValidationModule {
+                param($RepositoryRoot, $OutputDirectory)
+
+                Resolve-AzureValidationOutputDirectory `
+                    -RepositoryRoot $RepositoryRoot `
+                    -OutputDirectory $OutputDirectory
+            } $repositoryRoot $caseMismatchedOutput
+        } `
+        -ExpectedMessage `
+            'Validation output must remain below the repository build/validation directory.' `
+        -Message 'Unix validation containment accepted a case-mismatched sibling.'
+}
+
 $authState = [pscustomobject]@{
     platformEnabled = $true
     unauthenticatedClientAction = 'Return401'
@@ -1606,23 +2243,56 @@ Assert-Equal `
 
 $expectedIdentityId = Get-ExpectedRenderIdentityId `
     -SubscriptionId $tenantId `
-    -ResourceGroupName 'rg-html2b-dev'
+    -ResourceGroupName 'rg-html2b-dev' `
+    -RenderIdentityName 'id-html2b-render-dev'
 Assert-Equal `
     $expectedIdentityId `
     "/subscriptions/$tenantId/resourceGroups/rg-html2b-dev/providers/Microsoft.ManagedIdentity/userAssignedIdentities/id-html2b-render-dev" `
     'Render identity resource ID mismatch.'
 
-$entryScript = Join-Path $azureScripts 'Test-AzureDev.ps1'
+$entryValidationArguments = @{
+    EnvironmentName = 'dev'
+    SubscriptionId = $tenantId
+    ExpectedTenantId = $tenantId
+    ResourceGroupName = 'rg-html2b-dev'
+    FunctionAppName = 'func-html2b-api-dev'
+    RenderContainerAppName = 'ca-html2b-render-dev'
+    RenderApiClientId = $clientId
+    RenderRegistryServer = 'crhtml2bdev.azurecr.io'
+    RenderImageRepository = 'html2b-render'
+    RenderIdentityName = 'id-html2b-render-dev'
+    ApplicationInsightsName = 'appi-html2b-dev'
+    FunctionInstanceMemoryMB = 2048
+    FunctionMaximumInstanceCount = 1
+    RenderCpu = 1
+    RenderMemory = '2Gi'
+    RenderMinReplicas = 0
+    RenderMaxReplicas = 1
+    RenderHttpConcurrency = 1
+    OutputDirectory = 'build/validation/dev/offline'
+}
 Assert-Throws `
     -Action {
-        & $entryScript `
-            -SubscriptionId $tenantId `
-            -ExpectedTenantId $tenantId `
-            -RenderApiClientId $clientId `
+        & $entryScript @entryValidationArguments `
             -ExpectedRenderImage 'mutable-image:latest'
     } `
-    -ExpectedMessage 'ExpectedRenderImage must be the immutable Html2B Render digest.' `
+    -ExpectedMessage (
+        'ExpectedRenderImage must use the selected registry and repository ' +
+        'with an immutable lowercase sha256 digest.') `
     -Message 'Azure validator entry point did not delegate to the validation module.'
+
+$nonZeroMinReplicaArguments = $entryValidationArguments.Clone()
+$nonZeroMinReplicaArguments.RenderMinReplicas = 1
+Assert-Throws `
+    -Action {
+        & $entryScript @nonZeroMinReplicaArguments `
+            -ExpectedRenderImage (
+                'crhtml2bdev.azurecr.io/html2b-render@sha256:' +
+                ('d' * 64))
+    } `
+    -ExpectedMessage `
+        'RenderMinReplicas must be zero for the cold-start validation contract.' `
+    -Message 'Azure validator accepted a nonzero cold-start replica floor.'
 
 $functionAuthorizationProbe = & $azureValidationModule {
     param($SentinelFunctionKey)
@@ -1740,9 +2410,13 @@ $functionAuthorizationProbe = & $azureValidationModule {
             [string] $Subscription,
             [string] $ContainerAppResourceId,
             [string] $RevisionName,
+            [int] $MaximumReplicaCount,
             [TimeSpan] $Timeout
         )
 
+        if ($MaximumReplicaCount -ne 3) {
+            throw 'The Function authorization probe received the wrong replica cap.'
+        }
         $script:AuthorizationProbeEvents.Add('scale-to-zero')
         return 0.0
     }
@@ -1836,7 +2510,8 @@ $functionAuthorizationProbe = & $azureValidationModule {
             -BaseUri (
                 [uri] 'https://func-html2b-api-dev.azurewebsites.net/') `
             -ContainerAppResourceId 'container-app-resource-id' `
-            -RevisionName 'revision-name'
+            -RevisionName 'revision-name' `
+            -RenderMaximumReplicaCount 3
         $successEvents = @($script:AuthorizationProbeEvents)
         $successClients = @($script:AuthorizationProbeClients)
         $successHandlers = @($script:AuthorizationProbeHandlers)
@@ -1857,7 +2532,8 @@ $functionAuthorizationProbe = & $azureValidationModule {
             -BaseUri (
                 [uri] 'https://func-html2b-api-dev.azurewebsites.net/') `
             -ContainerAppResourceId 'container-app-resource-id' `
-            -RevisionName 'revision-name'
+            -RevisionName 'revision-name' `
+            -RenderMaximumReplicaCount 3
         $immediateReadyEvents = @($script:AuthorizationProbeEvents)
         $immediateReadyClients = @($script:AuthorizationProbeClients)
         $immediateReadyHandlers = @($script:AuthorizationProbeHandlers)
@@ -1880,7 +2556,8 @@ $functionAuthorizationProbe = & $azureValidationModule {
                 -BaseUri (
                     [uri] 'https://func-html2b-api-dev.azurewebsites.net/') `
                 -ContainerAppResourceId 'container-app-resource-id' `
-                -RevisionName 'revision-name'
+                -RevisionName 'revision-name' `
+                -RenderMaximumReplicaCount 3
         }
         catch {
             $failureMessage = $_.Exception.Message
