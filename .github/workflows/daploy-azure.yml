@@ -1,0 +1,373 @@
+name: Html2B Azure deployment
+
+on:
+  pull_request:
+    branches:
+      - main
+
+permissions:
+  contents: read
+
+jobs:
+  repository-validation:
+    name: Repository validation
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+
+    steps:
+      - name: Check out pull-request revision
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Set up .NET
+        uses: actions/setup-dotnet@a98b56852c35b8e3190ac28c8c2271da59106c68 # v6.0.0
+        with:
+          dotnet-version: 10.0.x
+          dotnet-quality: ga
+
+      - name: Verify .NET SDK
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          Set-StrictMode -Version Latest
+
+          $sdkVersionLines = @(dotnet --version)
+          if ($LASTEXITCODE -ne 0) {
+              throw ".NET SDK version readback failed with exit code $LASTEXITCODE."
+          }
+
+          $sdkVersion = ($sdkVersionLines -join "`n").Trim()
+          if ($sdkVersion -notmatch '^10\.0\.\d+$') {
+              throw "Expected a .NET 10 SDK but found: $sdkVersion"
+          }
+
+          ".NET SDK version: $sdkVersion"
+
+      - name: Restore solution
+        run: dotnet restore src/api/Html2b.slnx
+
+      - name: Build solution
+        run: >-
+          dotnet build src/api/Html2b.slnx
+          --configuration Release
+          --no-restore
+
+      - name: Test solution
+        run: >-
+          dotnet test src/api/Html2b.slnx
+          --configuration Release
+          --no-build
+
+      - name: Verify formatting
+        run: >-
+          dotnet format src/api/Html2b.slnx
+          --verify-no-changes
+          --no-restore
+
+      - name: Publish Functions
+        run: >-
+          dotnet publish
+          src/api/Html2b.AzureFunctions/Html2b.AzureFunctions.csproj
+          --configuration Release
+          --no-restore
+          --output build/release/functions/publish
+          /p:UseAppHost=false
+
+      - name: Inspect and package Functions
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          Set-StrictMode -Version Latest
+
+          $publishPath = Join-Path $PWD 'build/release/functions/publish'
+          $packagePath = Join-Path $PWD 'build/release/functions/html2b-functions.zip'
+          $hostPath = Join-Path $publishPath 'host.json'
+
+          if (-not (Test-Path -LiteralPath $hostPath -PathType Leaf)) {
+              throw 'Functions publish output must contain host.json at its root.'
+          }
+
+          $publishEntries = @(
+              Get-ChildItem -LiteralPath $publishPath -Recurse -Force
+          )
+          $linkedEntries = @(
+              $publishEntries |
+                  Where-Object {
+                      -not [string]::IsNullOrWhiteSpace($_.LinkType)
+                  }
+          )
+          if ($linkedEntries.Count -ne 0) {
+              throw 'Functions publish output contains a symbolic link.'
+          }
+
+          $localSettings = @(
+              $publishEntries |
+                  Where-Object {
+                      -not $_.PSIsContainer -and
+                      $_.Name -like 'local.settings*.json'
+                  }
+          )
+          if ($localSettings.Count -ne 0) {
+              throw 'Functions publish output contains a local settings file.'
+          }
+
+          if (Test-Path -LiteralPath $packagePath) {
+              Remove-Item -LiteralPath $packagePath -Force
+          }
+
+          [System.IO.Compression.ZipFile]::CreateFromDirectory(
+              $publishPath,
+              $packagePath,
+              [System.IO.Compression.CompressionLevel]::Optimal,
+              $false
+          )
+
+          $archive = [System.IO.Compression.ZipFile]::OpenRead($packagePath)
+          try {
+              $entryNames = @(
+                  $archive.Entries |
+                      ForEach-Object FullName |
+                      Sort-Object
+              )
+
+              $hostEntries = @(
+                  $entryNames |
+                      Where-Object {
+                          $_ -match '(?i)(^|/)host\.json$'
+                      }
+              )
+              if (
+                  $hostEntries.Count -ne 1 -or
+                  $hostEntries[0] -cne 'host.json'
+              ) {
+                  throw 'Functions package must contain exactly one root host.json.'
+              }
+
+              $packagedLocalSettings = @(
+                  $entryNames |
+                      Where-Object {
+                          $_ -match '(?i)(^|/)local\.settings[^/]*\.json$'
+                      }
+              )
+              if ($packagedLocalSettings.Count -ne 0) {
+                  throw 'Functions package contains a local settings file.'
+              }
+
+              $unsafeEntries = @(
+                  foreach ($entryName in $entryNames) {
+                      $trimmedEntryName = $entryName.TrimEnd('/')
+                      $segments = @($trimmedEntryName -split '/')
+                      if (
+                          [string]::IsNullOrWhiteSpace($trimmedEntryName) -or
+                          $entryName.Contains('\') -or
+                          $entryName.StartsWith('/') -or
+                          $entryName -match '^[A-Za-z]:' -or
+                          $segments -contains '.' -or
+                          $segments -contains '..' -or
+                          $segments -contains ''
+                      ) {
+                          $entryName
+                      }
+                  }
+              )
+              if ($unsafeEntries.Count -ne 0) {
+                  throw 'Functions package contains an unsafe entry path.'
+              }
+
+              "Functions package entries inspected: $($entryNames.Count)"
+          }
+          finally {
+              $archive.Dispose()
+          }
+
+          $checksum = Get-FileHash -LiteralPath $packagePath -Algorithm SHA256
+          "Functions package SHA-256: $($checksum.Hash.ToLowerInvariant())"
+
+      - name: Install pinned Bicep CLI
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          Set-StrictMode -Version Latest
+
+          az bicep install --version v0.45.15 --only-show-errors
+          if ($LASTEXITCODE -ne 0) {
+              throw "Bicep installation failed with exit code $LASTEXITCODE."
+          }
+
+          $bicepVersionLines = @(az bicep version)
+          if ($LASTEXITCODE -ne 0) {
+              throw "Bicep version readback failed with exit code $LASTEXITCODE."
+          }
+          $bicepVersion = ($bicepVersionLines -join "`n").Trim()
+          if ($bicepVersion -notmatch '\b0\.45\.15\b') {
+              throw "Expected Bicep 0.45.15 but found: $bicepVersion"
+          }
+
+          $bicepVersion
+
+      - name: Compile Bicep with non-deployable image
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          Set-StrictMode -Version Latest
+
+          $sentinelImage = 'invalid.local/html2b-render@sha256:' + ('0' * 64)
+          $templatePath = Join-Path $env:RUNNER_TEMP 'main.json'
+          $parametersPath = Join-Path $env:RUNNER_TEMP 'dev.parameters.json'
+
+          try {
+              $env:HTML2B_CONTAINER_IMAGE = $sentinelImage
+
+              az bicep build `
+                  --file bicep/main.bicep `
+                  --outfile $templatePath `
+                  --only-show-errors
+              if ($LASTEXITCODE -ne 0) {
+                  throw "Bicep template compilation failed with exit code $LASTEXITCODE."
+              }
+
+              az bicep build-params `
+                  --file bicep/environments/dev.bicepparam `
+                  --outfile $parametersPath `
+                  --only-show-errors
+              if ($LASTEXITCODE -ne 0) {
+                  throw "Bicep parameter compilation failed with exit code $LASTEXITCODE."
+              }
+          }
+          finally {
+              Remove-Item Env:HTML2B_CONTAINER_IMAGE -ErrorAction SilentlyContinue
+          }
+
+          $parameters = Get-Content -LiteralPath $parametersPath -Raw |
+              ConvertFrom-Json -Depth 100
+          $compiledImage = $parameters.parameters.containerImage.value
+          if ($compiledImage -cne $sentinelImage) {
+              throw 'Compiled containerImage does not match the non-deployable sentinel.'
+          }
+
+          'Bicep template and development parameters compiled with the sentinel image.'
+
+      - name: Parse PowerShell sources
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          Set-StrictMode -Version Latest
+
+          $scriptPaths = @(
+              git ls-files -- '*.ps1' '*.psm1'
+          )
+          if ($LASTEXITCODE -ne 0) {
+              throw "Tracked PowerShell discovery failed with exit code $LASTEXITCODE."
+          }
+          if ($scriptPaths.Count -eq 0) {
+              throw 'No tracked PowerShell sources were found.'
+          }
+
+          $parseFailures = [System.Collections.Generic.List[string]]::new()
+          foreach ($scriptPath in $scriptPaths) {
+              $tokens = $null
+              $parseErrors = $null
+              $absolutePath = Join-Path $PWD $scriptPath
+
+              [System.Management.Automation.Language.Parser]::ParseFile(
+                  $absolutePath,
+                  [ref] $tokens,
+                  [ref] $parseErrors
+              ) | Out-Null
+
+              foreach ($parseError in @($parseErrors)) {
+                  $parseFailures.Add(
+                      "${scriptPath}:$($parseError.Extent.StartLineNumber): " +
+                      $parseError.Message
+                  )
+              }
+          }
+
+          if ($parseFailures.Count -ne 0) {
+              throw "PowerShell parser errors:`n$($parseFailures -join "`n")"
+          }
+
+          "Parsed $($scriptPaths.Count) tracked PowerShell sources."
+
+      - name: Enforce credential-free pull-request boundary
+        if: ${{ always() }}
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          Set-StrictMode -Version Latest
+
+          $workflowPath = '.github/workflows/daploy-azure.yml'
+          $workflowLines = @(Get-Content -LiteralPath $workflowPath)
+          $auditStep = '      - name: Enforce credential-free pull-request boundary'
+          $auditIndexes = @(
+              for ($index = 0; $index -lt $workflowLines.Count; $index++) {
+                  if ($workflowLines[$index] -ceq $auditStep) {
+                      $index
+                  }
+              }
+          )
+          if ($auditIndexes.Count -ne 1 -or $auditIndexes[0] -le 0) {
+              throw 'The final workflow audit step must have one unique marker.'
+          }
+
+          $auditStart = $auditIndexes[0]
+          $laterSteps = @(
+              $workflowLines |
+                  Select-Object -Skip ($auditStart + 1) |
+                  Where-Object { $_ -match '^      - ' }
+          )
+          if ($laterSteps.Count -ne 0) {
+              throw 'The workflow audit must be the final job step.'
+          }
+
+          $auditedWorkflow = $workflowLines[0..($auditStart - 1)] -join "`n"
+          if (
+              $auditedWorkflow -notmatch
+                  '(?ms)\Aname: Html2B Azure deployment\n\non:\n  pull_request:\n    branches:\n      - main\n\npermissions:'
+          ) {
+              throw 'P01 must run only for pull requests targeting main.'
+          }
+
+          $permissionHeaders = [regex]::Matches(
+              $auditedWorkflow,
+              '(?m)^\s*permissions\s*:'
+          )
+          if ($permissionHeaders.Count -ne 2) {
+              throw 'Expected exactly one workflow and one job permission map.'
+          }
+          if (
+              $auditedWorkflow -notmatch
+                  '(?ms)^permissions:\n  contents: read\n\njobs:' -or
+              $auditedWorkflow -notmatch
+                  '(?ms)^    permissions:\n      contents: read\n\n    steps:'
+          ) {
+              throw 'Workflow and job permissions must contain only contents: read.'
+          }
+
+          $forbiddenPatterns = [ordered]@{
+              'GitHub Environment selection' = '(?m)^\s*environment\s*:'
+              'OIDC token permission' = '(?m)^\s*id-token\s*:'
+              'GitHub secret reference' = '(?i)\bsecrets\.'
+              'GitHub variable reference' = '(?i)\bvars\.'
+              'GitHub token reference' = '(?i)\b(github\.token|GITHUB_TOKEN|GH_TOKEN)\b'
+              'Azure login action' = '(?i)\bazure/login@'
+              'Azure deployment command' = '(?i)\baz\s+(deployment|acr|containerapp|functionapp)\b'
+              'push trigger' = '(?m)^\s{2}push\s*:'
+              'manual trigger' = '(?m)^\s{2}workflow_dispatch\s*:'
+          }
+
+          $violations = @(
+              foreach ($entry in $forbiddenPatterns.GetEnumerator()) {
+                  if ($auditedWorkflow -match $entry.Value) {
+                      $entry.Key
+                  }
+              }
+          )
+          if ($violations.Count -ne 0) {
+              throw "Credential-free boundary violations: $($violations -join ', ')"
+          }
+
+          'Pull-request validation contains no GitHub or Azure trust boundary.'
