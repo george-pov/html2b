@@ -480,6 +480,75 @@ Assert-Equal `
     ($applicationWorkflow -match $functionsActionAzureOutputPattern) `
     $true `
     'Functions Action does not override suppressed Azure CLI output with JSON.'
+$applicationInsightsExtensionPattern =
+    '(?ms)^\s+- name: Install Application Insights CLI extension\r?\n' +
+    '\s+shell: pwsh\r?\n' +
+    '\s+run: >-\r?\n' +
+    '\s+az extension add\r?\n' +
+    '\s+--name application-insights\r?\n' +
+    '\s+--version 1\.2\.3\r?\n' +
+    '\s+--yes\r?\n' +
+    '\s+--only-show-errors'
+Assert-Equal `
+    ([regex]::Matches(
+        $applicationWorkflow,
+        $applicationInsightsExtensionPattern).Count) `
+    1 `
+    'Application workflow does not install the pinned Application Insights CLI extension.'
+$extensionInstallIndex =
+    $applicationWorkflow.IndexOf(
+        '- name: Install Application Insights CLI extension',
+        [System.StringComparison]::Ordinal)
+$azureLoginIndex =
+    $applicationWorkflow.IndexOf(
+        '- name: Log in to Azure',
+        [System.StringComparison]::Ordinal)
+Assert-Equal `
+    ($extensionInstallIndex -ge 0 -and $extensionInstallIndex -lt $azureLoginIndex) `
+    $true `
+    'Application Insights CLI extension is not installed before Azure login.'
+$validationSummaryArtifactPattern =
+    '(?ms)^\s+- name: Upload sanitized validation summary\r?\n' +
+    '\s+if: \$\{\{ always\(\) && ' +
+    "steps\.validation\.outcome != 'skipped' \}\}\r?\n" +
+    '\s+uses: actions/upload-artifact@v7\.0\.1\r?\n' +
+    '\s+with:\r?\n' +
+    '\s+name: html2b-azure-validation-' +
+    '\$\{\{ github\.run_id \}\}-\$\{\{ github\.run_attempt \}\}\r?\n' +
+    '\s+path: build/validation/' +
+    '\$\{\{ inputs\.target_environment \}\}/application/' +
+    'validation-summary\.json\r?\n' +
+    '\s+if-no-files-found: error\r?\n' +
+    '\s+retention-days: 7'
+Assert-Equal `
+    ([regex]::Matches(
+        $applicationWorkflow,
+        $validationSummaryArtifactPattern).Count) `
+    1 `
+    'Application workflow does not always upload the sanitized validation summary.'
+$validationStepIndex =
+    $applicationWorkflow.IndexOf(
+        '- name: Validate deployment',
+        [System.StringComparison]::Ordinal)
+$validationSummaryArtifactIndex =
+    $applicationWorkflow.IndexOf(
+        '- name: Upload sanitized validation summary',
+        [System.StringComparison]::Ordinal)
+Assert-Equal `
+    (
+        $validationStepIndex -ge 0 -and
+        $validationSummaryArtifactIndex -ge 0 -and
+        $validationSummaryArtifactIndex -gt $validationStepIndex
+    ) `
+    $true `
+    'Sanitized validation summary upload does not follow live validation.'
+$validationStepPattern =
+    '(?ms)^\s+- name: Validate deployment\r?\n' +
+    '\s+id: validation\r?\n'
+Assert-Equal `
+    ($applicationWorkflow -match $validationStepPattern) `
+    $true `
+    'Application workflow does not identify the live validation step.'
 
 $workflowParameterBindings = [ordered]@{
     EnvironmentName = 'TARGET_ENVIRONMENT'
@@ -854,6 +923,72 @@ foreach ($keyedPath in @(
 }
 
 $azureStateValidationModule = Get-Module Html2b.AzureStateValidation
+$azureCliExitCodeProbe = & $azureStateValidationModule {
+    function az {
+        $global:LASTEXITCODE = 9
+        'sentinel-native-output-never-emit'
+    }
+
+    try {
+        try {
+            Invoke-AzureCli `
+                -Subscription 'subscription-id' `
+                -Operation 'probe handled native failure' `
+                -Arguments @('account', 'show')
+        }
+        catch {
+            [pscustomobject]@{
+                message = $_.Exception.Message
+                exitCode = $global:LASTEXITCODE
+            }
+        }
+    }
+    finally {
+        Remove-Item Function:\az -ErrorAction SilentlyContinue
+        $global:LASTEXITCODE = 0
+    }
+}
+Assert-Equal `
+    $azureCliExitCodeProbe.message `
+    "Azure CLI operation 'probe handled native failure' failed with exit code 9." `
+    'Azure CLI helper did not preserve its sanitized nonzero failure.'
+Assert-Equal `
+    $azureCliExitCodeProbe.exitCode `
+    0 `
+    'Azure CLI helper retained a handled native exit code.'
+$azureCliExceptionProbe = & $azureStateValidationModule {
+    function az {
+        $global:LASTEXITCODE = 11
+        throw 'sentinel-native-exception-never-emit'
+    }
+
+    try {
+        try {
+            Invoke-AzureCli `
+                -Subscription 'subscription-id' `
+                -Operation 'probe handled native exception' `
+                -Arguments @('account', 'show')
+        }
+        catch {
+            [pscustomobject]@{
+                message = $_.Exception.Message
+                exitCode = $global:LASTEXITCODE
+            }
+        }
+    }
+    finally {
+        Remove-Item Function:\az -ErrorAction SilentlyContinue
+        $global:LASTEXITCODE = 0
+    }
+}
+Assert-Equal `
+    $azureCliExceptionProbe.message `
+    "Azure CLI operation 'probe handled native exception' failed." `
+    'Azure CLI helper exposed or changed its sanitized native exception.'
+Assert-Equal `
+    $azureCliExceptionProbe.exitCode `
+    0 `
+    'Azure CLI helper retained a handled native exception exit code.'
 $authProjection = & $azureStateValidationModule {
     Get-RenderAuthenticationProjection
 }
