@@ -1,0 +1,121 @@
+name: Html2B Azure infrastructure deployment
+
+on:
+  workflow_dispatch:
+    inputs:
+      target_environment:
+        description: GitHub Environment to deploy
+        required: true
+        default: dev
+        type: environment
+      deployment_mode:
+        description: Preview or apply infrastructure
+        required: true
+        default: WhatIf
+        type: choice
+        options:
+          - WhatIf
+          - Apply
+      initial_render_image:
+        description: Digest-qualified image for initial provisioning only
+        required: false
+        default: ''
+        type: string
+      run_live_validation:
+        description: Run separately approved live validation after Apply
+        required: false
+        default: false
+        type: boolean
+
+permissions: {}
+
+jobs:
+  deploy-infrastructure:
+    name: Deploy infrastructure
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    environment:
+      name: ${{ inputs.target_environment }}
+    concurrency:
+      group: html2b-azure-${{ inputs.target_environment }}
+      queue: max
+    permissions:
+      contents: read
+      id-token: write
+    env:
+      AZURE_CORE_OUTPUT: none
+
+    steps:
+      - name: Check out infrastructure source
+        uses: actions/checkout@v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Log in to Azure
+        uses: Azure/login@v3.0.0
+        with:
+          client-id: ${{ vars.AZURE_INFRA_CLIENT_ID }}
+          tenant-id: ${{ vars.AZURE_TENANT_ID }}
+          subscription-id: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Preview or apply infrastructure
+        id: bicep
+        shell: pwsh
+        env:
+          TARGET_ENVIRONMENT: ${{ inputs.target_environment }}
+          DEPLOYMENT_MODE: ${{ inputs.deployment_mode }}
+          INITIAL_RENDER_IMAGE: ${{ inputs.initial_render_image }}
+          RUN_LIVE_VALIDATION: ${{ inputs.run_live_validation }}
+          AZURE_SUBSCRIPTION_ID: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+          AZURE_TENANT_ID: ${{ vars.AZURE_TENANT_ID }}
+          AZURE_RESOURCE_GROUP_NAME: ${{ vars.AZURE_RESOURCE_GROUP_NAME }}
+          AZURE_CONTAINER_REGISTRY_NAME: ${{ vars.AZURE_CONTAINER_REGISTRY_NAME }}
+          AZURE_RENDER_IMAGE_REPOSITORY: ${{ vars.AZURE_RENDER_IMAGE_REPOSITORY }}
+          AZURE_RENDER_CONTAINER_APP_NAME: ${{ vars.AZURE_RENDER_CONTAINER_APP_NAME }}
+        run: |
+          $parametersFile = ConvertFrom-Json @'
+          ${{ toJSON(vars.AZURE_BICEP_PARAMETERS_FILE) }}
+          '@
+
+          ./scripts/github/Build-Html2bBicep.ps1 `
+            -RepositoryRoot $PWD `
+            -ParametersFile $parametersFile `
+            -TargetEnvironment $env:TARGET_ENVIRONMENT `
+            -DeploymentMode $env:DEPLOYMENT_MODE `
+            -CurrentRef $env:GITHUB_REF `
+            -SubscriptionId $env:AZURE_SUBSCRIPTION_ID `
+            -ExpectedTenantId $env:AZURE_TENANT_ID `
+            -ResourceGroupName $env:AZURE_RESOURCE_GROUP_NAME `
+            -RegistryName $env:AZURE_CONTAINER_REGISTRY_NAME `
+            -ImageRepository $env:AZURE_RENDER_IMAGE_REPOSITORY `
+            -ContainerAppName $env:AZURE_RENDER_CONTAINER_APP_NAME `
+            -InitialRenderImage $env:INITIAL_RENDER_IMAGE `
+            -RunLiveValidation (
+              [bool]::Parse($env:RUN_LIVE_VALIDATION)
+            ) `
+            -GitHubOutputPath $env:GITHUB_OUTPUT
+
+      - name: Validate deployment
+        if: inputs.deployment_mode == 'Apply' && inputs.run_live_validation
+        shell: pwsh
+        env:
+          RENDER_IMAGE: ${{ steps.bicep.outputs.render_image }}
+          AZURE_SUBSCRIPTION_ID: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+          AZURE_TENANT_ID: ${{ vars.AZURE_TENANT_ID }}
+          AZURE_RESOURCE_GROUP_NAME: ${{ vars.AZURE_RESOURCE_GROUP_NAME }}
+          AZURE_FUNCTION_APP_NAME: ${{ vars.AZURE_FUNCTION_APP_NAME }}
+          AZURE_RENDER_CONTAINER_APP_NAME: ${{ vars.AZURE_RENDER_CONTAINER_APP_NAME }}
+          AZURE_RENDER_API_CLIENT_ID: ${{ vars.AZURE_RENDER_API_CLIENT_ID }}
+          AZURE_APPLICATION_INSIGHTS_NAME: ${{ vars.AZURE_APPLICATION_INSIGHTS_NAME }}
+        run: >-
+          ./scripts/azure/Test-AzureDev.ps1
+          -SubscriptionId $env:AZURE_SUBSCRIPTION_ID
+          -ExpectedTenantId $env:AZURE_TENANT_ID
+          -ResourceGroupName $env:AZURE_RESOURCE_GROUP_NAME
+          -FunctionAppName $env:AZURE_FUNCTION_APP_NAME
+          -RenderContainerAppName $env:AZURE_RENDER_CONTAINER_APP_NAME
+          -RenderApiClientId $env:AZURE_RENDER_API_CLIENT_ID
+          -ExpectedRenderImage $env:RENDER_IMAGE
+          -ApplicationInsightsName $env:AZURE_APPLICATION_INSIGHTS_NAME
