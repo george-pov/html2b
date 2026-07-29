@@ -15,7 +15,7 @@ jobs:
   deploy-application:
     name: Deploy application
     runs-on: ubuntu-latest
-    timeout-minutes: 90
+    timeout-minutes: 60
     environment:
       name: ${{ inputs.target_environment }}
     concurrency:
@@ -66,36 +66,25 @@ jobs:
       - name: Publish Render image
         id: render-image
         shell: pwsh
-        env:
-          AZURE_SUBSCRIPTION_ID: ${{ vars.AZURE_SUBSCRIPTION_ID }}
-          AZURE_TENANT_ID: ${{ vars.AZURE_TENANT_ID }}
-          AZURE_CONTAINER_REGISTRY_NAME: >-
-            ${{ vars.AZURE_CONTAINER_REGISTRY_NAME }}
-          AZURE_RENDER_IMAGE_REPOSITORY: >-
-            ${{ vars.AZURE_RENDER_IMAGE_REPOSITORY }}
         run: >-
           ./scripts/github/Publish-Html2bRender.ps1
           -SourceRoot $PWD
           -SourceSha $env:GITHUB_SHA
-          -SubscriptionId $env:AZURE_SUBSCRIPTION_ID
-          -ExpectedTenantId $env:AZURE_TENANT_ID
-          -RegistryName $env:AZURE_CONTAINER_REGISTRY_NAME
-          -ImageRepository $env:AZURE_RENDER_IMAGE_REPOSITORY
+          -SubscriptionId '${{ vars.AZURE_SUBSCRIPTION_ID }}'
+          -ExpectedTenantId '${{ vars.AZURE_TENANT_ID }}'
+          -RegistryName '${{ vars.AZURE_CONTAINER_REGISTRY_NAME }}'
+          -ImageRepository '${{ vars.AZURE_RENDER_IMAGE_REPOSITORY }}'
           -GitHubOutputPath $env:GITHUB_OUTPUT
 
       - name: Update Render
         shell: pwsh
         env:
           RENDER_IMAGE: ${{ steps.render-image.outputs.image }}
-          AZURE_SUBSCRIPTION_ID: ${{ vars.AZURE_SUBSCRIPTION_ID }}
-          AZURE_RESOURCE_GROUP_NAME: ${{ vars.AZURE_RESOURCE_GROUP_NAME }}
-          AZURE_RENDER_CONTAINER_APP_NAME: >-
-            ${{ vars.AZURE_RENDER_CONTAINER_APP_NAME }}
         run: >-
           ./scripts/github/Update-Html2bRender.ps1
-          -SubscriptionId $env:AZURE_SUBSCRIPTION_ID
-          -ResourceGroupName $env:AZURE_RESOURCE_GROUP_NAME
-          -ContainerAppName $env:AZURE_RENDER_CONTAINER_APP_NAME
+          -SubscriptionId '${{ vars.AZURE_SUBSCRIPTION_ID }}'
+          -ResourceGroupName '${{ vars.AZURE_RESOURCE_GROUP_NAME }}'
+          -ContainerAppName '${{ vars.AZURE_RENDER_CONTAINER_APP_NAME }}'
           -Image $env:RENDER_IMAGE
 
       - name: Deploy Functions
@@ -109,22 +98,13 @@ jobs:
         shell: pwsh
         env:
           RENDER_IMAGE: ${{ steps.render-image.outputs.image }}
-          AZURE_SUBSCRIPTION_ID: ${{ vars.AZURE_SUBSCRIPTION_ID }}
-          AZURE_TENANT_ID: ${{ vars.AZURE_TENANT_ID }}
-          AZURE_RESOURCE_GROUP_NAME: ${{ vars.AZURE_RESOURCE_GROUP_NAME }}
-          AZURE_FUNCTION_APP_NAME: ${{ vars.AZURE_FUNCTION_APP_NAME }}
-          AZURE_RENDER_CONTAINER_APP_NAME: >-
-            ${{ vars.AZURE_RENDER_CONTAINER_APP_NAME }}
-          AZURE_APPLICATION_INSIGHTS_NAME: >-
-            ${{ vars.AZURE_APPLICATION_INSIGHTS_NAME }}
-          AZURE_RENDER_API_CLIENT_ID: ${{ vars.AZURE_RENDER_API_CLIENT_ID }}
         run: >-
           ./scripts/azure/Test-AzureDev.ps1
-          -SubscriptionId $env:AZURE_SUBSCRIPTION_ID
-          -ExpectedTenantId $env:AZURE_TENANT_ID
-          -ResourceGroupName $env:AZURE_RESOURCE_GROUP_NAME
-          -FunctionAppName $env:AZURE_FUNCTION_APP_NAME
-          -RenderContainerAppName $env:AZURE_RENDER_CONTAINER_APP_NAME
-          -RenderApiClientId $env:AZURE_RENDER_API_CLIENT_ID
+          -SubscriptionId '${{ vars.AZURE_SUBSCRIPTION_ID }}'
+          -ExpectedTenantId '${{ vars.AZURE_TENANT_ID }}'
+          -ResourceGroupName '${{ vars.AZURE_RESOURCE_GROUP_NAME }}'
+          -FunctionAppName '${{ vars.AZURE_FUNCTION_APP_NAME }}'
+          -RenderContainerAppName '${{ vars.AZURE_RENDER_CONTAINER_APP_NAME }}'
+          -RenderApiClientId '${{ vars.AZURE_RENDER_API_CLIENT_ID }}'
           -ExpectedRenderImage $env:RENDER_IMAGE
-          -ApplicationInsightsName $env:AZURE_APPLICATION_INSIGHTS_NAME
+          -ApplicationInsightsName '${{ vars.AZURE_APPLICATION_INSIGHTS_NAME }}'
