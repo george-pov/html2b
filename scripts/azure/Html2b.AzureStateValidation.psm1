@@ -64,11 +64,13 @@ function Invoke-AzureCli {
         $output = & az @commandArguments 2>&1
     }
     catch {
+        $global:LASTEXITCODE = 0
         throw "Azure CLI operation '$Operation' failed."
     }
 
     $exitCode = $LASTEXITCODE
     if ($exitCode -ne 0) {
+        $global:LASTEXITCODE = 0
         throw "Azure CLI operation '$Operation' failed with exit code $exitCode."
     }
 

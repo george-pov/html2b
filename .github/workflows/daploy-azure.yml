@@ -56,6 +56,15 @@ jobs:
           -OutputDirectory
           (Join-Path $PWD 'build/release/functions')
 
+      - name: Install Application Insights CLI extension
+        shell: pwsh
+        run: >-
+          az extension add
+          --name application-insights
+          --version 1.2.3
+          --yes
+          --only-show-errors
+
       - name: Log in to Azure
         uses: Azure/login@v3.0.0
         with:
@@ -105,6 +114,7 @@ jobs:
           remote-build: false
 
       - name: Validate deployment
+        id: validation
         shell: pwsh
         env:
           TARGET_ENVIRONMENT: ${{ inputs.target_environment }}
@@ -149,3 +159,12 @@ jobs:
           -RenderHttpConcurrency $env:AZURE_RENDER_HTTP_CONCURRENCY
           -OutputDirectory
           (Join-Path $PWD "build/validation/$($env:TARGET_ENVIRONMENT)/application")
+
+      - name: Upload sanitized validation summary
+        if: ${{ always() && steps.validation.outcome != 'skipped' }}
+        uses: actions/upload-artifact@v7.0.1
+        with:
+          name: html2b-azure-validation-${{ github.run_id }}-${{ github.run_attempt }}
+          path: build/validation/${{ inputs.target_environment }}/application/validation-summary.json
+          if-no-files-found: error
+          retention-days: 7
