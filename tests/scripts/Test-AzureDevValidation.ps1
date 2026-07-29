@@ -439,6 +439,19 @@ foreach ($retiredLiteral in @(
         $false `
         "Azure validation retained environment-specific literal $retiredLiteral."
 }
+$reusableValidationModules = Get-ChildItem `
+    -LiteralPath $azureScripts `
+    -Filter 'Html2b.*.psm1' `
+    -File
+foreach ($reusableValidationModule in $reusableValidationModules) {
+    $reusableValidationSource = Get-Content `
+        -LiteralPath $reusableValidationModule.FullName `
+        -Raw
+    Assert-Equal `
+        ($reusableValidationSource -match '(?i)\bp03\b') `
+        $false `
+        "Reusable validation module $($reusableValidationModule.Name) retained a P03 label."
+}
 
 $applicationWorkflowPath = Join-Path `
     $repositoryRoot `
@@ -456,6 +469,16 @@ Assert-Equal `
     ($applicationWorkflow -match "'\s*\$\{\{\s*vars\.") `
     $false `
     'Application workflow interpolates an Environment value into PowerShell source.'
+$functionsActionAzureOutputPattern =
+    '(?ms)^\s*- name: Deploy Functions\r?\n' +
+    '\s+uses: Azure/functions-action@v1\.5\.6\r?\n' +
+    '\s+env:\r?\n' +
+    '\s+AZURE_CORE_OUTPUT: json\r?\n' +
+    '\s+with:'
+Assert-Equal `
+    ($applicationWorkflow -match $functionsActionAzureOutputPattern) `
+    $true `
+    'Functions Action does not override suppressed Azure CLI output with JSON.'
 
 $workflowParameterBindings = [ordered]@{
     EnvironmentName = 'TARGET_ENVIRONMENT'
