@@ -31,19 +31,25 @@ Set `RenderService__BaseUrl` in the copied file to:
 http://localhost:8081
 ```
 
-The Functions host validates this value as an absolute HTTP or HTTPS URI during
-startup.
+The tracked sample intentionally omits `RenderService__Audience`; leave it
+unset. The Functions host permits token-free HTTP only for a loopback Render
+address and requires an empty audience for that case. Local execution needs no
+Azure credential or client secret. Non-loopback HTTP and a loopback request
+carrying an authorization header are rejected.
 
-## Restore and Build
+## Restore, Build, and Test
 
 Run from the repository root:
 
 ```powershell
 dotnet restore src/api/Html2b.slnx
 dotnet build src/api/Html2b.slnx --configuration Release --no-restore
+dotnet test src/api/Html2b.slnx --configuration Release --no-build
 ```
 
-The solution contains no automated test project.
+The solution includes `src/api/Test/Html2b.Infrastructure.Tests`. Its tests
+cover Render URL and audience validation, managed-identity token handling,
+dependency registration, readiness, cancellation, and gateway failure handling.
 
 ## Run from the Command Line
 
@@ -106,6 +112,12 @@ The health responses report `live` and `ready`. Each render request returns a
 non-empty file with the content type documented in
 [HTTP API](../api/http-api.md).
 
+Local Core Tools accepts these loopback readiness and render requests without a
+Function key. That local behavior verifies routes and output only; it is not
+proof of the deployed Azure Functions key boundary. The tracked
+`Html2b.AzureFunctions.http` sample contains only a `<function-key>`
+placeholder.
+
 ## Stop the Hosts
 
 Stop Core Tools with Ctrl+C. Stop Render and remove the Compose network:
@@ -121,3 +133,7 @@ docker compose down
 - If readiness returns `503`, wait for Chromium startup to complete and retry.
 - If Functions startup rejects the Render URL, confirm the copied local setting
   contains the absolute local address shown above.
+- If startup reports that the audience must be empty, remove
+  `RenderService__Audience` from the loopback configuration.
+- A non-loopback HTTP Render URL is rejected; local configuration does not
+  fall back to anonymous remote transport.
