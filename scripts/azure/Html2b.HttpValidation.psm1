@@ -329,7 +329,7 @@ function Invoke-ExpectedFunctionAuthorizationRejection {
 
         return [ordered]@{
             host = 'Function'
-            phase = 'protected-p03'
+            phase = 'function-key-enforcement'
             method = $Method
             path = $Uri.AbsolutePath
             scenario = $Scenario
