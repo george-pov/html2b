@@ -271,6 +271,7 @@ function New-TestRenderState {
 }
 
 $azureValidationModule = Get-Module Html2b.AzureDevValidation
+$httpValidationModule = Get-Module Html2b.HttpValidation
 $azureValidationModuleAst =
     $azureValidationModule.SessionState.InvokeCommand.
         GetCommand(
@@ -1305,6 +1306,46 @@ Assert-Equal `
     @($authorizationCases | Where-Object { $_.Contains('bearerToken') }).Count `
     0 `
     'Authorization matrix definition exposed a bearer token.'
+
+$sentinelWrongAudienceToken = 'sentinel-wrong-audience-token-never-emit'
+$wrongAudienceTokenProbe = & $httpValidationModule {
+    param($SentinelWrongAudienceToken)
+
+    $script:capturedArguments = $null
+    function az {
+        $script:capturedArguments = @($args)
+        $global:LASTEXITCODE = 0
+        $SentinelWrongAudienceToken
+    }
+
+    $wrongAudienceToken = $null
+    try {
+        $wrongAudienceToken = Get-WrongAudienceAccessToken `
+            -Subscription 'subscription-id'
+        [ordered]@{
+            tokenMatched =
+                $wrongAudienceToken -ceq $SentinelWrongAudienceToken
+            arguments = @($script:capturedArguments)
+        }
+    }
+    finally {
+        $wrongAudienceToken = $null
+        $script:capturedArguments = $null
+        Remove-Item Function:\az -ErrorAction SilentlyContinue
+        $global:LASTEXITCODE = 0
+    }
+} $sentinelWrongAudienceToken
+Assert-Equal `
+    $wrongAudienceTokenProbe.tokenMatched `
+    $true `
+    'Wrong-audience token retrieval did not capture the exact CLI value.'
+Assert-Equal `
+    ($wrongAudienceTokenProbe.arguments -join ' ') `
+    (
+        'account get-access-token --subscription subscription-id ' +
+        '--query accessToken --output tsv --only-show-errors'
+    ) `
+    'Wrong-audience token retrieval did not reuse the cached default ARM token.'
 
 if ($null -eq ('Html2b.Tests.AlwaysUnauthorizedHandler' -as [type])) {
     Add-Type -TypeDefinition @'

@@ -586,7 +586,6 @@ function Get-WrongAudienceAccessToken {
         try {
             $tokenOutput = & az account get-access-token `
                 --subscription $Subscription `
-                --resource 'https://management.azure.com/' `
                 --query accessToken `
                 --output tsv `
                 --only-show-errors 2>$null
