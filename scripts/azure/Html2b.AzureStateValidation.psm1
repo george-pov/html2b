@@ -4,7 +4,7 @@ $PSNativeCommandUseErrorActionPreference = $true
 
 $script:FunctionApiVersion = '2024-04-01'
 $script:ContainerAppsApiVersion = '2026-01-01'
-$script:RenderRegistryServer = 'crhtml2bdev.azurecr.io'
+
 function ConvertTo-CanonicalGuid {
     param(
         [Parameter(Mandatory)]
@@ -398,7 +398,13 @@ function Assert-FunctionConfiguration {
         [string] $ExpectedRenderUrl,
 
         [Parameter(Mandatory)]
-        [string] $ExpectedAudience
+        [string] $ExpectedAudience,
+
+        [Parameter(Mandatory)]
+        [int] $ExpectedInstanceMemoryMB,
+
+        [Parameter(Mandatory)]
+        [int] $ExpectedMaximumInstanceCount
     )
 
     if ($State.properties.state -ne 'Running' -or
@@ -425,9 +431,10 @@ function Assert-FunctionConfiguration {
     }
 
     $scale = $State.properties.functionAppConfig.scaleAndConcurrency
-    if ([int] $scale.instanceMemoryMB -ne 2048 -or
-        [int] $scale.maximumInstanceCount -ne 1) {
-        throw 'The Function App scale contract is not 2048 MiB and one instance.'
+    if ([int] $scale.instanceMemoryMB -ne $ExpectedInstanceMemoryMB -or
+        [int] $scale.maximumInstanceCount -ne
+            $ExpectedMaximumInstanceCount) {
+        throw 'The Function App scale contract does not match the selected Environment.'
     }
 
     $identity = $State.identity
@@ -476,6 +483,10 @@ function Assert-FunctionConfiguration {
             name = [string] $runtime.name
             version = [string] $runtime.version
         }
+        scale = [ordered]@{
+            instanceMemoryMB = [int] $scale.instanceMemoryMB
+            maximumInstanceCount = [int] $scale.maximumInstanceCount
+        }
         identity = [ordered]@{
             type = [string] $identity.type
             principalId = $principalId
@@ -497,7 +508,25 @@ function Assert-RenderContainerConfiguration {
         [string] $ExpectedImage,
 
         [Parameter(Mandatory)]
-        [string] $ExpectedIdentityId
+        [string] $ExpectedIdentityId,
+
+        [Parameter(Mandatory)]
+        [string] $ExpectedRegistryServer,
+
+        [Parameter(Mandatory)]
+        [double] $ExpectedCpu,
+
+        [Parameter(Mandatory)]
+        [string] $ExpectedMemory,
+
+        [Parameter(Mandatory)]
+        [int] $ExpectedMinReplicas,
+
+        [Parameter(Mandatory)]
+        [int] $ExpectedMaxReplicas,
+
+        [Parameter(Mandatory)]
+        [int] $ExpectedHttpConcurrency
     )
 
     if ($State.properties.provisioningState -ne 'Succeeded') {
@@ -518,7 +547,7 @@ function Assert-RenderContainerConfiguration {
     )
     if ($identityIds.Count -ne 1 -or
         $identityIds[0] -ine $ExpectedIdentityId) {
-        throw 'Render does not have exactly the planned ACR identity.'
+        throw 'Render does not have exactly the selected identity.'
     }
 
     $configuration = $State.properties.configuration
@@ -542,9 +571,9 @@ function Assert-RenderContainerConfiguration {
 
     $registries = @($configuration.registries)
     if ($registries.Count -ne 1 -or
-        $registries[0].server -cne $script:RenderRegistryServer -or
+        $registries[0].server -cne $ExpectedRegistryServer -or
         $registries[0].identity -ine $ExpectedIdentityId) {
-        throw 'Render registry configuration does not use its planned identity.'
+        throw 'Render registry configuration does not match the selected Environment.'
     }
 
     $identitySettings = @($configuration.identitySettings)
@@ -570,9 +599,9 @@ function Assert-RenderContainerConfiguration {
     if ($container.image -cne $ExpectedImage) {
         throw "Render image '$($container.image)' does not match the expected digest."
     }
-    if ([double] $container.resources.cpu -ne 1 -or
-        $container.resources.memory -ne '2Gi') {
-        throw 'Render resources do not match 1 vCPU and 2Gi.'
+    if ([double] $container.resources.cpu -ne $ExpectedCpu -or
+        $container.resources.memory -cne $ExpectedMemory) {
+        throw 'Render resources do not match the selected Environment.'
     }
 
     $environment = Get-OptionalPropertyValue `
@@ -632,8 +661,8 @@ function Assert-RenderContainerConfiguration {
         throw 'Render termination grace period is not 30 seconds.'
     }
     $scale = $template.scale
-    if ([int] $scale.minReplicas -ne 0 -or
-        [int] $scale.maxReplicas -ne 1 -or
+    if ([int] $scale.minReplicas -ne $ExpectedMinReplicas -or
+        [int] $scale.maxReplicas -ne $ExpectedMaxReplicas -or
         [int] $scale.pollingInterval -ne 30 -or
         [int] $scale.cooldownPeriod -ne 300) {
         throw 'Render scale timing or replica limits have drifted.'
@@ -641,8 +670,9 @@ function Assert-RenderContainerConfiguration {
     $rules = @($scale.rules)
     if ($rules.Count -ne 1 -or
         $rules[0].name -ne 'http-one-render' -or
-        [string] $rules[0].http.metadata.concurrentRequests -ne '1') {
-        throw 'Render HTTP concurrency contract is not one active render.'
+        [int] $rules[0].http.metadata.concurrentRequests -ne
+            $ExpectedHttpConcurrency) {
+        throw 'Render HTTP concurrency does not match the selected Environment.'
     }
 
     if ([string]::IsNullOrWhiteSpace(
@@ -658,6 +688,11 @@ function Assert-RenderContainerConfiguration {
         runningStatus = [string] $State.properties.runningStatus
         image = [string] $container.image
         identityId = $ExpectedIdentityId
+        registryServer = [string] $registries[0].server
+        resources = [ordered]@{
+            cpu = [double] $container.resources.cpu
+            memory = [string] $container.resources.memory
+        }
         ingress = [ordered]@{
             external = [bool] $ingress.external
             allowInsecure = [bool] $ingress.allowInsecure
@@ -669,7 +704,8 @@ function Assert-RenderContainerConfiguration {
         scale = [ordered]@{
             minReplicas = [int] $scale.minReplicas
             maxReplicas = [int] $scale.maxReplicas
-            concurrentRequests = [string] $rules[0].http.metadata.concurrentRequests
+            concurrentRequests =
+                [string] $rules[0].http.metadata.concurrentRequests
         }
     }
 }

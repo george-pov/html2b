@@ -15,7 +15,6 @@ Import-Module `
     (Join-Path $PSScriptRoot 'Html2b.TelemetryEvidence.psm1') `
     -Force
 
-$script:RenderIdentityName = 'id-html2b-render-dev'
 $script:FunctionTelemetryClockSkewGuard = [TimeSpan]::FromSeconds(30)
 
 function Get-ExpectedRenderIdentityId {
@@ -24,13 +23,72 @@ function Get-ExpectedRenderIdentityId {
         [string] $SubscriptionId,
 
         [Parameter(Mandatory)]
-        [string] $ResourceGroupName
+        [string] $ResourceGroupName,
+
+        [Parameter(Mandatory)]
+        [string] $RenderIdentityName
     )
 
     return "/subscriptions/$SubscriptionId/" +
         "resourceGroups/$ResourceGroupName/providers/" +
         "Microsoft.ManagedIdentity/userAssignedIdentities/" +
-        $script:RenderIdentityName
+        $RenderIdentityName
+}
+
+function Assert-ImmutableRenderImageReference {
+    param(
+        [Parameter(Mandatory)]
+        [string] $Image,
+
+        [Parameter(Mandatory)]
+        [string] $RegistryServer,
+
+        [Parameter(Mandatory)]
+        [string] $ImageRepository
+    )
+
+    $pattern = '^{0}/{1}@sha256:[0-9a-f]{{64}}$' -f (
+        [regex]::Escape($RegistryServer)),
+        ([regex]::Escape($ImageRepository))
+    if ($Image -cnotmatch $pattern) {
+        throw (
+            'ExpectedRenderImage must use the selected registry and ' +
+            'repository with an immutable lowercase sha256 digest.')
+    }
+}
+
+function Resolve-AzureValidationOutputDirectory {
+    param(
+        [Parameter(Mandatory)]
+        [string] $RepositoryRoot,
+
+        [Parameter(Mandatory)]
+        [string] $OutputDirectory
+    )
+
+    $validationRoot = [System.IO.Path]::GetFullPath(
+        (Join-Path $RepositoryRoot 'build\validation'))
+    $resolvedOutputDirectory = [System.IO.Path]::GetFullPath(
+        $OutputDirectory,
+        $RepositoryRoot)
+    $validationRootPrefix = $validationRoot.TrimEnd(
+        [System.IO.Path]::DirectorySeparatorChar,
+        [System.IO.Path]::AltDirectorySeparatorChar
+    ) + [System.IO.Path]::DirectorySeparatorChar
+
+    $pathComparison = if ([System.OperatingSystem]::IsWindows()) {
+        [System.StringComparison]::OrdinalIgnoreCase
+    }
+    else {
+        [System.StringComparison]::Ordinal
+    }
+    if (-not $resolvedOutputDirectory.StartsWith(
+            $validationRootPrefix,
+            $pathComparison)) {
+        throw 'Validation output must remain below the repository build/validation directory.'
+    }
+
+    return $resolvedOutputDirectory
 }
 
 function Wait-RenderScaledToZero {
@@ -43,6 +101,10 @@ function Wait-RenderScaledToZero {
 
         [Parameter(Mandatory)]
         [string] $RevisionName,
+
+        [Parameter(Mandatory)]
+        [ValidateRange(1, [int]::MaxValue)]
+        [int] $MaximumReplicaCount,
 
         [TimeSpan] $Timeout = [TimeSpan]::FromMinutes(10)
     )
@@ -58,7 +120,7 @@ function Wait-RenderScaledToZero {
         if ($replicas.Count -eq 0) {
             return [Math]::Round($stopwatch.Elapsed.TotalSeconds, 1)
         }
-        if ($replicas.Count -gt 1) {
+        if ($replicas.Count -gt $MaximumReplicaCount) {
             throw "Render exceeded its replica cap with $($replicas.Count) replicas."
         }
 
@@ -282,6 +344,10 @@ function Invoke-FunctionAuthorizationValidation {
         [Parameter(Mandatory)]
         [string] $RevisionName,
 
+        [Parameter(Mandatory)]
+        [ValidateRange(1, [int]::MaxValue)]
+        [int] $RenderMaximumReplicaCount,
+
         [ValidateSet('default')]
         [string] $FunctionHostKeyName = 'default'
     )
@@ -305,7 +371,7 @@ function Invoke-FunctionAuthorizationValidation {
             -Client $anonymousClient `
             -Uri ([uri]::new($BaseUri, 'health/live')) `
             -ExpectedBodyStatus 'live' `
-            -Phase 'anonymous-p03' `
+            -Phase 'anonymous-pre-key' `
             -HostLabel 'Function'
 
         $contracts += Invoke-ExpectedFunctionAuthorizationRejection `
@@ -323,7 +389,8 @@ function Invoke-FunctionAuthorizationValidation {
         $coldReadyScaleSeconds = Wait-RenderScaledToZero `
             -Subscription $Subscription `
             -ContainerAppResourceId $ContainerAppResourceId `
-            -RevisionName $RevisionName
+            -RevisionName $RevisionName `
+            -MaximumReplicaCount $RenderMaximumReplicaCount
         $earliestKeyedStartTime =
             $noKeyEndTime.Add($script:FunctionTelemetryClockSkewGuard)
         $earliestKeyedStartTime =
@@ -411,7 +478,8 @@ function Invoke-FunctionAuthorizationValidation {
         $coldPngScaleSeconds = Wait-RenderScaledToZero `
             -Subscription $Subscription `
             -ContainerAppResourceId $ContainerAppResourceId `
-            -RevisionName $RevisionName
+            -RevisionName $RevisionName `
+            -MaximumReplicaCount $RenderMaximumReplicaCount
         $coldWake.pngScaleToZeroSeconds = $coldPngScaleSeconds
         $contracts += Invoke-RenderContract `
             -Client $keyedClient `
@@ -461,20 +529,27 @@ function Invoke-Html2bAzureDevValidation {
     param(
         [Parameter(Mandatory)]
         [ValidateNotNullOrEmpty()]
+        [string] $EnvironmentName,
+
+        [Parameter(Mandatory)]
+        [ValidateNotNullOrEmpty()]
         [string] $SubscriptionId,
 
         [Parameter(Mandatory)]
         [ValidateNotNullOrEmpty()]
         [string] $ExpectedTenantId,
 
+        [Parameter(Mandatory)]
         [ValidateNotNullOrEmpty()]
-        [string] $ResourceGroupName = 'rg-html2b-dev',
+        [string] $ResourceGroupName,
 
+        [Parameter(Mandatory)]
         [ValidateNotNullOrEmpty()]
-        [string] $FunctionAppName = 'func-html2b-api-dev',
+        [string] $FunctionAppName,
 
+        [Parameter(Mandatory)]
         [ValidateNotNullOrEmpty()]
-        [string] $RenderContainerAppName = 'ca-html2b-render-dev',
+        [string] $RenderContainerAppName,
 
         [Parameter(Mandatory)]
         [ValidateNotNullOrEmpty()]
@@ -482,10 +557,55 @@ function Invoke-Html2bAzureDevValidation {
 
         [Parameter(Mandatory)]
         [ValidateNotNullOrEmpty()]
+        [string] $RenderRegistryServer,
+
+        [Parameter(Mandatory)]
+        [ValidateNotNullOrEmpty()]
+        [string] $RenderImageRepository,
+
+        [Parameter(Mandatory)]
+        [ValidateNotNullOrEmpty()]
+        [string] $RenderIdentityName,
+
+        [Parameter(Mandatory)]
+        [ValidateNotNullOrEmpty()]
         [string] $ExpectedRenderImage,
 
+        [Parameter(Mandatory)]
         [ValidateNotNullOrEmpty()]
-        [string] $ApplicationInsightsName = 'appi-html2b-dev',
+        [string] $ApplicationInsightsName,
+
+        [Parameter(Mandatory)]
+        [ValidateRange(1, [int]::MaxValue)]
+        [int] $FunctionInstanceMemoryMB,
+
+        [Parameter(Mandatory)]
+        [ValidateRange(1, [int]::MaxValue)]
+        [int] $FunctionMaximumInstanceCount,
+
+        [Parameter(Mandatory)]
+        [ValidateScript({ $_ -gt 0 })]
+        [double] $RenderCpu,
+
+        [Parameter(Mandatory)]
+        [ValidateNotNullOrEmpty()]
+        [string] $RenderMemory,
+
+        [Parameter(Mandatory)]
+        [ValidateRange(0, [int]::MaxValue)]
+        [int] $RenderMinReplicas,
+
+        [Parameter(Mandatory)]
+        [ValidateRange(1, [int]::MaxValue)]
+        [int] $RenderMaxReplicas,
+
+        [Parameter(Mandatory)]
+        [ValidateRange(1, [int]::MaxValue)]
+        [int] $RenderHttpConcurrency,
+
+        [Parameter(Mandatory)]
+        [ValidateNotNullOrEmpty()]
+        [string] $OutputDirectory,
 
         [ValidateSet('default')]
         [string] $FunctionHostKeyName = 'default',
@@ -504,20 +624,26 @@ $canonicalRenderApiClientId = ConvertTo-CanonicalGuid `
     -Value $RenderApiClientId `
     -ParameterName 'RenderApiClientId'
 
-if ($ExpectedRenderImage -cnotmatch
-    '^crhtml2bdev\.azurecr\.io/html2b-render@sha256:[0-9a-f]{64}$') {
-    throw 'ExpectedRenderImage must be the immutable Html2B Render digest.'
+if ($RenderMinReplicas -ne 0) {
+    throw 'RenderMinReplicas must be zero for the cold-start validation contract.'
 }
+$null = Assert-ImmutableRenderImageReference `
+    -Image $ExpectedRenderImage `
+    -RegistryServer $RenderRegistryServer `
+    -ImageRepository $RenderImageRepository
+
+$repositoryRoot = (Resolve-Path (Join-Path $PSScriptRoot '..\..')).Path
+$resolvedOutputDirectory = Resolve-AzureValidationOutputDirectory `
+    -RepositoryRoot $repositoryRoot `
+    -OutputDirectory $OutputDirectory
+$summaryPath = Join-Path $resolvedOutputDirectory 'validation-summary.json'
+
 if (-not (Get-Command az -ErrorAction SilentlyContinue)) {
     throw 'Azure CLI is required.'
 }
 
-$repositoryRoot = (Resolve-Path (Join-Path $PSScriptRoot '..\..')).Path
-$outputDirectory =
-    Join-Path $repositoryRoot 'build\validation\005\p03\live'
-$summaryPath = Join-Path $outputDirectory 'validation-summary.json'
 $validation = [ordered]@{
-    phase = 'P03'
+    environment = $EnvironmentName
     status = 'running'
     account = $null
     function = $null
@@ -566,18 +692,27 @@ try {
     $renderAudience = "api://$canonicalRenderApiClientId"
     $expectedRenderIdentityId = Get-ExpectedRenderIdentityId `
         -SubscriptionId $canonicalSubscriptionId `
-        -ResourceGroupName $ResourceGroupName
+        -ResourceGroupName $ResourceGroupName `
+        -RenderIdentityName $RenderIdentityName
 
     $validation.function = Assert-FunctionConfiguration `
         -State $functionState `
         -Settings $functionSettings `
         -ExpectedTenant $canonicalTenantId `
         -ExpectedRenderUrl $renderUrl `
-        -ExpectedAudience $renderAudience
+        -ExpectedAudience $renderAudience `
+        -ExpectedInstanceMemoryMB $FunctionInstanceMemoryMB `
+        -ExpectedMaximumInstanceCount $FunctionMaximumInstanceCount
     $validation.render = Assert-RenderContainerConfiguration `
         -State $renderState `
         -ExpectedImage $ExpectedRenderImage `
-        -ExpectedIdentityId $expectedRenderIdentityId
+        -ExpectedIdentityId $expectedRenderIdentityId `
+        -ExpectedRegistryServer $RenderRegistryServer `
+        -ExpectedCpu $RenderCpu `
+        -ExpectedMemory $RenderMemory `
+        -ExpectedMinReplicas $RenderMinReplicas `
+        -ExpectedMaxReplicas $RenderMaxReplicas `
+        -ExpectedHttpConcurrency $RenderHttpConcurrency
     $validation.renderAuthentication =
         Assert-RenderAuthenticationConfiguration `
             -State $renderAuthenticationState `
@@ -597,7 +732,7 @@ try {
             -ContainerAppResourceId $renderState.id `
             -RevisionName $renderState.properties.latestRevisionName
     )
-    if ($initialReplicas.Count -gt 1) {
+    if ($initialReplicas.Count -gt $RenderMaxReplicas) {
         throw "Render exceeded its replica cap with $($initialReplicas.Count) replicas."
     }
 
@@ -611,6 +746,7 @@ try {
             -BaseUri $functionBaseUri `
             -ContainerAppResourceId $renderState.id `
             -RevisionName $renderState.properties.latestRevisionName `
+            -RenderMaximumReplicaCount $RenderMaxReplicas `
             -FunctionHostKeyName $FunctionHostKeyName
     $validation.functionAuthorization = [ordered]@{
         keyName = $functionAuthorization.keyName
@@ -661,7 +797,13 @@ try {
     $null = Assert-RenderContainerConfiguration `
         -State $finalRenderState `
         -ExpectedImage $ExpectedRenderImage `
-        -ExpectedIdentityId $expectedRenderIdentityId
+        -ExpectedIdentityId $expectedRenderIdentityId `
+        -ExpectedRegistryServer $RenderRegistryServer `
+        -ExpectedCpu $RenderCpu `
+        -ExpectedMemory $RenderMemory `
+        -ExpectedMinReplicas $RenderMinReplicas `
+        -ExpectedMaxReplicas $RenderMaxReplicas `
+        -ExpectedHttpConcurrency $RenderHttpConcurrency
     if ($finalRenderState.properties.latestRevisionName -ne
         $renderState.properties.latestRevisionName) {
         throw 'The Render revision changed during validation.'
@@ -672,7 +814,7 @@ try {
             -ContainerAppResourceId $finalRenderState.id `
             -RevisionName $finalRenderState.properties.latestRevisionName
     )
-    if ($finalReplicas.Count -gt 1) {
+    if ($finalReplicas.Count -gt $RenderMaxReplicas) {
         throw "Render exceeded its replica cap with $($finalReplicas.Count) replicas."
     }
     $validation.render.replicaCountAfterValidation = $finalReplicas.Count
@@ -710,11 +852,11 @@ Write-Host "Sanitized validation: $summaryPath"
 if ($validation.evidenceGaps.Count -gt 0) {
     $evidenceGapCodes = $validation.evidenceGaps.code -join ', '
     Write-Warning (
-        'P03 HTTP, auth-policy, revision, probe, and replica validation passed, ' +
+        'HTTP, auth-policy, revision, probe, and replica validation passed, ' +
         "but evidence gaps remain: $evidenceGapCodes.")
 }
 else {
-    Write-Host 'P03 Function-key and protected-Render Azure validation passed.'
+    Write-Host 'Function-key and protected-Render Azure validation passed.'
 }
 }
 
