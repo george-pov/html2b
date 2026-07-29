@@ -49,7 +49,6 @@ src/api/
 
 bicep/
   main.bicep
-  bootstrap.bicep
   environments/
   modules/
 ```

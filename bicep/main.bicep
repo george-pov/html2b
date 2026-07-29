@@ -26,7 +26,6 @@ param functionMaximumInstanceCount int
 @minLength(36)
 @maxLength(36)
 param renderApiClientId string
-param renderAuthenticationEnabled bool
 param renderIdentityName string
 param renderContainerAppName string
 param renderCpu int
@@ -34,17 +33,9 @@ param renderMemory string
 param renderMinReplicas int
 param renderMaxReplicas int
 param renderHttpConcurrency int
-param containerImage string = ''
+param containerImage string
 
 var renderServiceAudience = 'api://${renderApiClientId}'
-var normalizedRenderApiClientId = toLower(renderApiClientId)
-var renderApiClientIdWithoutSeparators = replace(normalizedRenderApiClientId, '-', '')
-var renderApiClientIdWithoutAllowedCharacters = replace(replace(replace(replace(replace(replace(replace(replace(replace(replace(replace(replace(replace(replace(replace(replace(renderApiClientIdWithoutSeparators, '0', ''), '1', ''), '2', ''), '3', ''), '4', ''), '5', ''), '6', ''), '7', ''), '8', ''), '9', ''), 'a', ''), 'b', ''), 'c', ''), 'd', ''), 'e', ''), 'f', '')
-var expectedContainerImagePrefix = '${containerRegistryName}.azurecr.io/${imageRepositoryName}@sha256:'
-var containerImageWithoutAllowedCharacters = replace(replace(replace(replace(replace(replace(replace(replace(replace(replace(replace(replace(replace(replace(replace(replace(replace(containerImage, expectedContainerImagePrefix, ''), '0', ''), '1', ''), '2', ''), '3', ''), '4', ''), '5', ''), '6', ''), '7', ''), '8', ''), '9', ''), 'a', ''), 'b', ''), 'c', ''), 'd', ''), 'e', ''), 'f', '')
-
-assert renderApiClientIdIsDFormatGuid = length(renderApiClientIdWithoutSeparators) == 32 && empty(renderApiClientIdWithoutAllowedCharacters) && substring(renderApiClientId, 8, 1) == '-' && substring(renderApiClientId, 13, 1) == '-' && substring(renderApiClientId, 18, 1) == '-' && substring(renderApiClientId, 23, 1) == '-'
-assert containerImageIsEmptyOrImmutable = empty(containerImage) || (startsWith(containerImage, expectedContainerImagePrefix) && length(containerImage) == length(expectedContainerImagePrefix) + 64 && containerImage == toLower(containerImage) && empty(containerImageWithoutAllowedCharacters))
 
 var baseTags = {
   Application: 'Html2B'
@@ -110,7 +101,6 @@ module renderAuthenticationDeployment 'modules/render-auth.bicep' = {
   name: 'render-auth-${environmentName}'
   scope: environmentResourceGroup
   params: {
-    enabled: renderAuthenticationEnabled
     tenantId: tenant().tenantId
     renderApiClientId: renderApiClientId
     functionPrincipalId: functionsDeployment.outputs.functionPrincipalId

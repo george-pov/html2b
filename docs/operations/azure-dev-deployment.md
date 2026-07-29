@@ -15,9 +15,9 @@ environment parameters, and command output during the release.
 ## Repository Sources
 
 - `bicep/main.bicep` composes the application infrastructure.
-- `bicep/bootstrap.bicep` configures repository-scoped registry access for the
-  signed-in operator when that access is absent.
 - `bicep/environments/dev.bicepparam` contains tracked development parameters.
+  It reads the release-specific immutable Render image from the operator's
+  `HTML2B_CONTAINER_IMAGE` environment variable.
 - `bicep/modules/` contains the Functions and Render resource definitions.
 - `src/api/Html2b.Render/Dockerfile` builds the Render image.
 - `src/api/Html2b.AzureFunctions/Html2b.AzureFunctions.csproj` builds the
@@ -44,8 +44,9 @@ Functions-plus-Render topology and are not release commands for it.
 - .NET 10 SDK.
 - Azure CLI with Bicep.
 - An Azure CLI session with permission to validate and apply the templates,
-  build in the registry, publish the Functions package, and manage the required
-  registry data role assignments.
+  build in the registry, publish the Functions package, and manage the Render
+  image-pull role assignment.
+- Existing repository-scoped registry Writer access for the signed-in operator.
 - Permission to read the existing Function host key during validation.
 - A clean Git working tree at the source revision being released.
 
@@ -68,14 +69,10 @@ dotnet test src/api/Html2b.slnx --configuration Release --no-build
 dotnet format src/api/Html2b.slnx --verify-no-changes --no-restore
 
 az bicep build --file bicep/main.bicep --stdout | Out-Null
-az bicep build --file bicep/bootstrap.bicep --stdout | Out-Null
-az bicep build-params `
-    --file bicep/environments/dev.bicepparam `
-    --stdout |
-    Out-Null
 ```
 
-Stop if restore, build, tests, formatting, or Bicep compilation fails.
+Stop if restore, build, tests, formatting, or Bicep compilation fails. Compile
+the environment parameters after selecting the immutable Render image.
 
 ## Select and Verify the Azure Context
 
@@ -83,10 +80,9 @@ Stop if restore, build, tests, formatting, or Bicep compilation fails.
 2. List the available subscriptions.
 3. Select the development subscription in the local shell.
 4. Read the active account back from Azure CLI and verify it before continuing.
-5. Resolve the signed-in operator identity only in the local shell.
-6. Confirm that the shared resources referenced by the tracked environment
+5. Confirm that the shared resources referenced by the tracked environment
    parameters exist.
-7. Read the Render API client ID from the selected tracked environment
+6. Read the Render API client ID from the selected tracked environment
    parameters without copying it into this guide.
 
 Do not copy values returned by these checks into documentation or tracked
@@ -117,6 +113,18 @@ tracked output.
 Record the selected image digest, Functions source revision, ZIP checksum, and
 their verified compatibility in ignored release output.
 
+Set `HTML2B_CONTAINER_IMAGE` in the operator's session to the complete
+digest-qualified image reference, then compile the environment parameters:
+
+```powershell
+az bicep build-params `
+    --file bicep/environments/dev.bicepparam `
+    --stdout |
+    Out-Null
+```
+
+Stop if parameter compilation fails.
+
 ## Prepare the Render Image
 
 Perform these steps only when the release changes Render:
@@ -129,9 +137,8 @@ Perform these steps only when the release changes Render:
 5. Keep the source revision and resolved digest together in ignored release
    output.
 
-Run the bootstrap template only when the signed-in operator lacks the required
-repository-scoped registry data access. Supply the operator identity at
-execution time and inspect the role scope before applying it.
+Repository-scoped registry Writer access is an operator prerequisite. The
+application templates do not grant or migrate deployment-operator access.
 
 ## Prepare the Functions Package
 
@@ -163,24 +170,6 @@ that was used for compatibility validation.
 
 Do not replace the reviewed image input or environment parameters between the
 preview and apply commands.
-
-## Order Authentication Changes Safely
-
-When a release changes the authentication boundaries, use this order:
-
-1. Establish the Function system identity, Render base URL, and Render audience
-   through a reviewed infrastructure preview and apply.
-2. Deploy and verify Functions code that can call Render with the
-   system-assigned identity.
-3. Preview, review, and enable Container Apps authentication; verify
-   Function-mediated success and direct unauthenticated rejection.
-4. Prove that an existing Function host key can be read without output or
-   persistence.
-5. Deploy the Functions package whose readiness and render triggers require
-   Function authorization.
-
-Do not combine a failed step with the next mutation. Keep the previous verified
-Functions ZIP available throughout the sequence.
 
 ## Publish the Functions Package
 
@@ -264,13 +253,10 @@ deployment. If it restores anonymous readiness or render triggers, the rollback
 temporarily reopens those public Functions routes; record and limit that
 exposure until the corrected Function-authorized package is redeployed.
 
-If Container Apps authentication itself must be disabled, create a fresh
-current-state full-payload What-If that changes only the authentication
-platform state and retains the current image and other settings. Review it and
-obtain separate rollback approval before applying it. Disabling authentication
-reopens the public Render hostname to anonymous callers; treat that as an
-explicit temporary exposure and re-enable the reviewed policy after the
-failure is corrected.
+The application templates keep Container Apps authentication enabled and do
+not provide an authentication-disable rollback mode. Any emergency change that
+reopens direct anonymous Render access is outside the repository deployment
+shape and requires separate review and authorization.
 
 Use a coordinated two-host rollback only when the failed release changed both
 artifacts. Select the exact verified source and immutable artifact for each

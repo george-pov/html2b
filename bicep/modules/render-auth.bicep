@@ -1,6 +1,5 @@
 targetScope = 'resourceGroup'
 
-param enabled bool
 param tenantId string
 param renderApiClientId string
 param functionPrincipalId string
@@ -44,7 +43,7 @@ resource renderAuthConfig 'Microsoft.App/containerApps/authConfigs@2026-01-01' =
       }
     }
     platform: {
-      enabled: enabled
+      enabled: true
     }
   }
 }
