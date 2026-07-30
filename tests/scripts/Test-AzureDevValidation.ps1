@@ -466,6 +466,133 @@ $applicationWorkflow = Get-Content `
 $infrastructureWorkflow = Get-Content `
     -LiteralPath $infrastructureWorkflowPath `
     -Raw
+$automaticDeploymentTargetExpression =
+    '${{ github.event_name == ''push'' && ''dev'' || inputs.target_environment }}'
+$expectedAutomaticApplicationPaths = @(
+    'src/api/**'
+    '.dockerignore'
+    'scripts/github/Resolve-Html2bDeploymentSource.ps1'
+    'scripts/github/Publish-Html2bFunctions.ps1'
+    'scripts/github/Publish-Html2bRender.ps1'
+    'scripts/github/Update-Html2bRender.ps1'
+    'scripts/azure/Test-AzureDev.ps1'
+    'scripts/azure/Html2b.AzureDevValidation.psm1'
+    'scripts/azure/Html2b.AzureStateValidation.psm1'
+    'scripts/azure/Html2b.HttpValidation.psm1'
+    'scripts/azure/Html2b.OutputContracts.psm1'
+    'scripts/azure/Html2b.TelemetryEvidence.psm1'
+    '.github/workflows/daploy-azure.yml'
+)
+$automaticPushPattern =
+    '(?ms)^  push:\r?\n' +
+    '    branches:\r?\n' +
+    '      - main\r?\n' +
+    '    paths:\r?\n' +
+    '(?<paths>(?:      - [^\r\n]+\r?\n)+)' +
+    '  workflow_dispatch:'
+$automaticPushMatch = [regex]::Match(
+    $applicationWorkflow,
+    $automaticPushPattern)
+Assert-Equal `
+    $automaticPushMatch.Success `
+    $true `
+    'Application workflow does not have the exact main push trigger shape.'
+$automaticApplicationPaths = @(
+    [regex]::Matches(
+        $automaticPushMatch.Groups['paths'].Value,
+        '(?m)^      - (?<path>[^\r\n]+)\r?$') |
+        ForEach-Object { $_.Groups['path'].Value }
+)
+Assert-Equal `
+    ($automaticApplicationPaths -join "`n") `
+    ($expectedAutomaticApplicationPaths -join "`n") `
+    'Application workflow automatic path allowlist mismatch.'
+$runtimeApplicationPathsPattern =
+    '(?ms)^          \$applicationPaths = @\(\r?\n' +
+    '(?<paths>(?:              ''[^\r\n'']+''\r?\n)+)' +
+    '          \)$'
+$runtimeApplicationPathsMatch = [regex]::Match(
+    $applicationWorkflow,
+    $runtimeApplicationPathsPattern)
+Assert-Equal `
+    $runtimeApplicationPathsMatch.Success `
+    $true `
+    'Application workflow runtime path allowlist shape mismatch.'
+$runtimeApplicationPaths = @(
+    [regex]::Matches(
+        $runtimeApplicationPathsMatch.Groups['paths'].Value,
+        "^\s+'(?<path>[^']+)'\r?$",
+        [System.Text.RegularExpressions.RegexOptions]::Multiline) |
+        ForEach-Object { $_.Groups['path'].Value }
+)
+Assert-Equal `
+    ($runtimeApplicationPaths -join "`n") `
+    ($expectedAutomaticApplicationPaths -join "`n") `
+    'Application workflow runtime path allowlist mismatch.'
+Assert-Equal `
+    ([regex]::Matches(
+        $applicationWorkflow,
+        [regex]::Escape($automaticDeploymentTargetExpression)).Count) `
+    4 `
+    'Application workflow automatic/manual target resolution count mismatch.'
+foreach ($targetConsumer in @(
+        "name: $automaticDeploymentTargetExpression",
+        "group: html2b-azure-$automaticDeploymentTargetExpression",
+        "TARGET_ENVIRONMENT: $automaticDeploymentTargetExpression",
+        "path: build/validation/$automaticDeploymentTargetExpression/" +
+            'application/validation-summary.json')) {
+    Assert-Equal `
+        $applicationWorkflow.Contains($targetConsumer) `
+        $true `
+        "Application workflow does not use target resolution for $targetConsumer."
+}
+Assert-Equal `
+    ($applicationWorkflow -match '(?m)^\s*pull_request:') `
+    $false `
+    'Application workflow unexpectedly has a pull-request trigger.'
+Assert-Equal `
+    $applicationWorkflow.Contains('      queue: max') `
+    $true `
+    'Application workflow does not preserve queued concurrency.'
+Assert-Equal `
+    ($applicationWorkflow -match '(?m)^\s*cancel-in-progress:\s*true\s*$') `
+    $false `
+    'Application workflow can cancel an in-progress deployment.'
+$sourceValidationIndex = $applicationWorkflow.IndexOf(
+    '- name: Validate main source',
+    [System.StringComparison]::Ordinal)
+$mixedChangeGuardIndex = $applicationWorkflow.IndexOf(
+    '- name: Block mixed application and Bicep changes',
+    [System.StringComparison]::Ordinal)
+$dotnetSetupIndex = $applicationWorkflow.IndexOf(
+    '- name: Set up .NET',
+    [System.StringComparison]::Ordinal)
+Assert-Equal `
+    (
+        $sourceValidationIndex -ge 0 -and
+        $mixedChangeGuardIndex -gt $sourceValidationIndex -and
+        $dotnetSetupIndex -gt $mixedChangeGuardIndex
+    ) `
+    $true `
+    'Application workflow mixed-change guard does not run before publication.'
+foreach ($mixedChangeGuardContract in @(
+        'if: ${{ github.event_name == ''push'' }}',
+        'PUSH_BEFORE_SHA: ${{ github.event.before }}',
+        'Automatic application deployment stopped because this push has no ',
+        'approved application or pipeline input change.',
+        'Run infrastructure What-If/Apply first, then manually dispatch ',
+        'this application workflow for exact source $env:GITHUB_SHA.')) {
+    Assert-Equal `
+        $applicationWorkflow.Contains($mixedChangeGuardContract) `
+        $true `
+        'Application workflow mixed-change guard contract mismatch.'
+}
+Assert-Equal `
+    ([regex]::Matches(
+        $applicationWorkflow,
+        'git diff --quiet --no-renames').Count) `
+    2 `
+    'Application workflow does not classify both application and Bicep paths.'
 Assert-Equal `
     ($applicationWorkflow -match "'\s*\$\{\{\s*vars\.") `
     $false `
@@ -516,7 +643,8 @@ $validationSummaryArtifactPattern =
     '\s+name: html2b-azure-validation-' +
     '\$\{\{ github\.run_id \}\}-\$\{\{ github\.run_attempt \}\}\r?\n' +
     '\s+path: build/validation/' +
-    '\$\{\{ inputs\.target_environment \}\}/application/' +
+    [regex]::Escape($automaticDeploymentTargetExpression) +
+    '/application/' +
     'validation-summary\.json\r?\n' +
     '\s+if-no-files-found: error\r?\n' +
     '\s+retention-days: 7'
