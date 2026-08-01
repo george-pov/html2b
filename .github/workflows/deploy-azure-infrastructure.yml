@@ -16,9 +16,9 @@ on:
         options:
           - WhatIf
           - Apply
-      initial_render_image:
-        description: Digest-qualified image for initial provisioning only
-        required: false
+      render_image:
+        description: Digest-qualified Render image for this infrastructure run
+        required: true
         default: ''
         type: string
 
@@ -45,7 +45,6 @@ jobs:
       - name: Check out infrastructure source
         uses: actions/checkout@v7.0.1
         with:
-          fetch-depth: 0
           persist-credentials: false
 
       - name: Log in to Azure
@@ -56,34 +55,75 @@ jobs:
           subscription-id: ${{ vars.AZURE_SUBSCRIPTION_ID }}
 
       - name: Preview or apply infrastructure
-        id: bicep
         shell: pwsh
         env:
           TARGET_ENVIRONMENT: ${{ inputs.target_environment }}
           DEPLOYMENT_MODE: ${{ inputs.deployment_mode }}
-          INITIAL_RENDER_IMAGE: ${{ inputs.initial_render_image }}
+          RENDER_IMAGE: ${{ inputs.render_image }}
           AZURE_SUBSCRIPTION_ID: ${{ vars.AZURE_SUBSCRIPTION_ID }}
-          AZURE_TENANT_ID: ${{ vars.AZURE_TENANT_ID }}
-          AZURE_RESOURCE_GROUP_NAME: ${{ vars.AZURE_RESOURCE_GROUP_NAME }}
-          AZURE_CONTAINER_REGISTRY_NAME: ${{ vars.AZURE_CONTAINER_REGISTRY_NAME }}
-          AZURE_RENDER_IMAGE_REPOSITORY: ${{ vars.AZURE_RENDER_IMAGE_REPOSITORY }}
-          AZURE_RENDER_CONTAINER_APP_NAME: ${{ vars.AZURE_RENDER_CONTAINER_APP_NAME }}
         run: |
+          $ErrorActionPreference = 'Stop'
+          $PSNativeCommandUseErrorActionPreference = $true
+
           $parametersFile = ConvertFrom-Json @'
           ${{ toJSON(vars.AZURE_BICEP_PARAMETERS_FILE) }}
           '@
 
-          ./scripts/github/Build-Html2bBicep.ps1 `
-            -RepositoryRoot $PWD `
-            -ParametersFile $parametersFile `
-            -TargetEnvironment $env:TARGET_ENVIRONMENT `
-            -DeploymentMode $env:DEPLOYMENT_MODE `
-            -CurrentRef $env:GITHUB_REF `
-            -SubscriptionId $env:AZURE_SUBSCRIPTION_ID `
-            -ExpectedTenantId $env:AZURE_TENANT_ID `
-            -ResourceGroupName $env:AZURE_RESOURCE_GROUP_NAME `
-            -RegistryName $env:AZURE_CONTAINER_REGISTRY_NAME `
-            -ImageRepository $env:AZURE_RENDER_IMAGE_REPOSITORY `
-            -ContainerAppName $env:AZURE_RENDER_CONTAINER_APP_NAME `
-            -InitialRenderImage $env:INITIAL_RENDER_IMAGE `
-            -GitHubOutputPath $env:GITHUB_OUTPUT
+          if ([string]::IsNullOrWhiteSpace($parametersFile)) {
+            throw 'The selected Environment has no Bicep parameters file.'
+          }
+          if (-not (Test-Path -LiteralPath $parametersFile -PathType Leaf)) {
+            throw "Bicep parameters file was not found: $parametersFile"
+          }
+          if ($env:RENDER_IMAGE -notmatch '^[a-z0-9.-]+/[a-z0-9._/-]+@sha256:[a-f0-9]{64}$') {
+            throw 'Render image must be a lowercase digest-qualified image reference.'
+          }
+
+          $env:HTML2B_CONTAINER_IMAGE = $env:RENDER_IMAGE
+          $parametersPath = Join-Path $env:RUNNER_TEMP 'html2b-parameters.json'
+          az bicep build-params `
+            --file $parametersFile `
+            --outfile $parametersPath `
+            --only-show-errors
+
+          $parameters = Get-Content -LiteralPath $parametersPath -Raw |
+            ConvertFrom-Json -Depth 100
+          $location = [string] $parameters.parameters.location.value
+          if ([string]::IsNullOrWhiteSpace($location)) {
+            throw 'The compiled Bicep parameters contain no deployment location.'
+          }
+
+          $deploymentName = 'html2b-{0}-infra-{1}' -f `
+            $env:TARGET_ENVIRONMENT, $env:GITHUB_RUN_ID
+          $deploymentArguments = @(
+            'deployment', 'sub', 'what-if',
+            '--subscription', $env:AZURE_SUBSCRIPTION_ID,
+            '--name', $deploymentName,
+            '--location', $location,
+            '--template-file', 'bicep/main.bicep',
+            '--parameters', "@$parametersPath",
+            '--no-prompt', 'true',
+            '--only-show-errors',
+            '--output', 'json',
+            '--result-format', 'ResourceIdOnly',
+            '--no-pretty-print'
+          )
+          $whatIf = (& az @deploymentArguments) | ConvertFrom-Json -Depth 100
+          if (@($whatIf.changes | Where-Object { $_.changeType -ceq 'Delete' }).Count -ne 0) {
+            throw 'Azure What-If contains a resource deletion; Apply is blocked.'
+          }
+
+          if ($env:DEPLOYMENT_MODE -ceq 'Apply') {
+            $applyArguments = @(
+              'deployment', 'sub', 'create',
+              '--subscription', $env:AZURE_SUBSCRIPTION_ID,
+              '--name', $deploymentName,
+              '--location', $location,
+              '--template-file', 'bicep/main.bicep',
+              '--parameters', "@$parametersPath",
+              '--no-prompt', 'true',
+              '--only-show-errors',
+              '--output', 'none'
+            )
+            $null = & az @applyArguments
+          }
