@@ -96,9 +96,9 @@ tracked output.
 
 ## Choose the Release Shape
 
-- For a Function-only change, retain the currently deployed immutable Render
-  image, revalidate its digest and live state, and build only the Functions ZIP
-  from its exact clean source.
+- For a Function-only change, supply the known currently deployed immutable
+  Render image digest and build only the Functions ZIP from its exact clean
+  source.
 - When Render changes, build a new immutable Render image. When both hosts
   change together, build the image and Functions ZIP from the same clean
   revision.
@@ -158,8 +158,6 @@ that was used for compatibility validation.
 5. Apply only the intended infrastructure changes with the same inputs reviewed
    by What-If. A Function-only package release requires no Bicep apply when the
    preview contains no intended infrastructure change.
-6. Read the Functions and Render host information from the deployment outputs
-   into the local shell.
 
 Do not replace the reviewed image input or environment parameters between the
 preview and apply commands.
@@ -170,10 +168,14 @@ Immediately before deployment, recheck the clean source revision, exact ZIP
 checksum, selected Azure context, and verified previous Functions ZIP. Publish
 only the prepared ZIP to the Functions host resolved in the local shell.
 
-The deployment workflows complete after Azure accepts the Render revision
-update and Functions package deployment. They do not make post-deployment HTTP
-requests, retrieve Function keys, wait for cold starts, query telemetry, or
-assert live Azure resource state.
+The infrastructure workflow completes after Azure accepts the Bicep Apply. It
+requires an explicit digest-qualified Render image for every run, performs a
+What-If that blocks Apply when it includes a deletion, and does not make
+post-Apply Azure resource readback checks. Application deployment completes
+after Azure accepts the Render revision update and Functions package
+deployment. It does not make post-deployment HTTP requests, retrieve Function
+keys, wait for cold starts, query telemetry, or assert live Azure resource
+state.
 
 ## Roll Back
 

@@ -11,9 +11,6 @@ $applicationWorkflowPath = Join-Path `
 $infrastructureWorkflowPath = Join-Path `
     $repositoryRoot `
     '.github\workflows\deploy-azure-infrastructure.yml'
-$infrastructureScriptPath = Join-Path `
-    $repositoryRoot `
-    'scripts\github\Build-Html2bBicep.ps1'
 
 function Assert-Condition {
     param(
@@ -32,9 +29,6 @@ function Assert-Condition {
 $applicationWorkflow = Get-Content -LiteralPath $applicationWorkflowPath -Raw
 $infrastructureWorkflow = Get-Content `
     -LiteralPath $infrastructureWorkflowPath `
-    -Raw
-$infrastructureScript = Get-Content `
-    -LiteralPath $infrastructureScriptPath `
     -Raw
 
 Assert-Condition `
@@ -78,9 +72,6 @@ foreach ($term in $validatorTerms) {
     Assert-Condition `
         -Condition (-not $infrastructureWorkflow.Contains($term)) `
         -Message "Infrastructure workflow retains removed validation term '$term'."
-    Assert-Condition `
-        -Condition (-not $infrastructureScript.Contains($term)) `
-        -Message "Infrastructure deployment script retains removed validation term '$term'."
 }
 
 foreach ($action in @(
@@ -133,6 +124,30 @@ Assert-Condition `
 Assert-Condition `
     -Condition (-not $infrastructureWorkflow.Contains('run_live_validation')) `
     -Message 'Infrastructure workflow retains the removed live-validation input.'
+Assert-Condition `
+    -Condition ($infrastructureWorkflow.Contains('render_image:') -and
+        $infrastructureWorkflow.Contains('required: true') -and
+        $infrastructureWorkflow.Contains('HTML2B_CONTAINER_IMAGE')) `
+    -Message 'Infrastructure workflow no longer requires an explicit Render image.'
+Assert-Condition `
+    -Condition ($infrastructureWorkflow.Contains('az bicep build-params') -and
+        $infrastructureWorkflow.Contains('az @deploymentArguments') -and
+        $infrastructureWorkflow.Contains('az @applyArguments')) `
+    -Message 'Infrastructure workflow no longer compiles and deploys Bicep directly.'
+Assert-Condition `
+    -Condition ($infrastructureWorkflow.Contains("changeType -ceq 'Delete'") -and
+        $infrastructureWorkflow.Contains('Apply is blocked.')) `
+    -Message 'Infrastructure workflow no longer blocks Apply after a destructive What-If.'
+foreach ($term in @(
+        'Build-Html2bBicep.ps1',
+        'initial_render_image',
+        'deployment sub validate',
+        'Container App inventory',
+        'render_image=$resolvedImage')) {
+    Assert-Condition `
+        -Condition (-not $infrastructureWorkflow.Contains($term)) `
+        -Message "Infrastructure workflow retains removed deployment term '$term'."
+}
 
 $deletedValidatorFiles = @(
     'scripts/azure/Test-AzureDev.ps1'
@@ -150,7 +165,8 @@ foreach ($relativePath in $deletedValidatorFiles) {
 
 foreach ($relativePath in @(
         'scripts/github/Publish-Html2bRender.ps1',
-        'scripts/github/Update-Html2bRender.ps1')) {
+        'scripts/github/Update-Html2bRender.ps1',
+        'scripts/github/Build-Html2bBicep.ps1')) {
     Assert-Condition `
         -Condition (-not (Test-Path (Join-Path $repositoryRoot $relativePath))) `
         -Message "Removed Render deployment script still exists: $relativePath"
