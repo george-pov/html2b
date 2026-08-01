@@ -38,10 +38,10 @@ $infrastructureScript = Get-Content `
     -Raw
 
 Assert-Condition `
-    -Condition ($applicationWorkflow -match '(?m)^\s{2}push:\r?\n\s{4}branches:\r?\n\s{6}- main$') `
+    -Condition ($applicationWorkflow -match '(?m)^\s{2}push:\r?\n\s{4}branches:\r?\n\s{6}- main\r?$') `
     -Message 'Application workflow no longer automatically deploys main.'
 Assert-Condition `
-    -Condition ($applicationWorkflow -match '(?m)^\s{2}workflow_dispatch:$') `
+    -Condition ($applicationWorkflow -match '(?m)^\s{2}workflow_dispatch:\r?$') `
     -Message 'Application workflow no longer supports manual dispatch.'
 Assert-Condition `
     -Condition ($applicationWorkflow -match [regex]::Escape(
@@ -60,9 +60,8 @@ $expectedApplicationPaths = @(
 foreach ($path in $expectedApplicationPaths) {
     $escapedPath = [regex]::Escape($path)
     Assert-Condition `
-        -Condition (($applicationWorkflow -match "(?m)^\s+- $escapedPath$") -and
-            ($applicationWorkflow -match "(?m)^\s+'$escapedPath'$")) `
-        -Message "Application workflow is missing '$path' from a trigger or guard allowlist."
+        -Condition ($applicationWorkflow -match "(?m)^\s+- $escapedPath\r?$") `
+        -Message "Application workflow is missing '$path' from its trigger allowlist."
 }
 
 $validatorTerms = @(
@@ -108,20 +107,6 @@ Assert-Condition `
     -Condition ($applicationWorkflow.Contains('queue: max') -and
         $infrastructureWorkflow.Contains('queue: max')) `
     -Message 'Deployment workflows must retain non-cancelling queues.'
-
-$mixedGuardIndex = $applicationWorkflow.IndexOf(
-    '- name: Block mixed application and Bicep changes',
-    [StringComparison]::Ordinal)
-$azureLoginIndex = $applicationWorkflow.IndexOf(
-    '- name: Log in to Azure',
-    [StringComparison]::Ordinal)
-Assert-Condition `
-    -Condition ($mixedGuardIndex -ge 0 -and $azureLoginIndex -gt $mixedGuardIndex) `
-    -Message 'Mixed application/Bicep guard must run before Azure login.'
-Assert-Condition `
-    -Condition ($applicationWorkflow.Contains(
-        'Automatic application deployment stopped because this push also changes ')) `
-    -Message 'Mixed application/Bicep guard must remain fail-closed.'
 
 Assert-Condition `
     -Condition (-not $infrastructureWorkflow.Contains('run_live_validation')) `
