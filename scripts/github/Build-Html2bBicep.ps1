@@ -45,8 +45,6 @@ param(
     [AllowEmptyString()]
     [string] $InitialRenderImage = '',
 
-    [bool] $RunLiveValidation = $false,
-
     [AllowEmptyString()]
     [string] $GitHubOutputPath = ''
 )
@@ -868,9 +866,6 @@ $resolvedParametersFile = Resolve-Html2bBicepParametersFile `
 
 if ($CurrentRef -cne 'refs/heads/main') {
     throw 'Infrastructure deployment must be dispatched from main.'
-}
-if ($RunLiveValidation -and $DeploymentMode -cne 'Apply') {
-    throw 'Live validation can be selected only with Apply.'
 }
 if (-not (Get-Command az -ErrorAction SilentlyContinue)) {
     throw 'Azure CLI is required.'

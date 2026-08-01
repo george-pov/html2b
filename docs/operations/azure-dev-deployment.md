@@ -4,7 +4,7 @@ Html2B uses an operator-driven Azure release. Bicep provisions the application
 infrastructure, Azure Container Registry builds the Render image, and the
 Functions package is deployed separately. Each changed artifact is produced
 from clean source and recorded with its immutable identity. A Function-only
-release retains and revalidates the deployed immutable Render image; a release
+release retains the deployed immutable Render image; a release
 that changes both hosts builds both artifacts from the same clean revision.
 
 This guide intentionally contains no environment-specific identifiers,
@@ -22,8 +22,6 @@ environment parameters, and command output during the release.
 - `src/api/Html2b.Render/Dockerfile` builds the Render image.
 - `src/api/Html2b.AzureFunctions/Html2b.AzureFunctions.csproj` builds the
   Functions package.
-- `scripts/azure/Test-AzureDev.ps1` validates the current two-host
-  authentication, health, output, and Azure resource contracts.
 
 The deployment uses existing shared registry, logging, and Container Apps
 environment resources. The application templates create or update the
@@ -47,16 +45,11 @@ Functions-plus-Render topology and are not release commands for it.
   build in the registry, publish the Functions package, and manage the Render
   image-pull role assignment.
 - Existing repository-scoped registry Writer access for the signed-in operator.
-- Permission to read the existing Function host key during validation.
 - A clean Git working tree at the source revision being released.
 
 Keep subscription, tenant, operator, resource, host, and artifact values in the
 operator's session or ignored release output. Do not add them to source files
 or this guide.
-
-Function keys and access tokens remain process-local. Never print them, place
-them in process arguments, save them in release output, or add them to
-documentation or source.
 
 ## Validate the Repository Sources
 
@@ -177,81 +170,19 @@ Immediately before deployment, recheck the clean source revision, exact ZIP
 checksum, selected Azure context, and verified previous Functions ZIP. Publish
 only the prepared ZIP to the Functions host resolved in the local shell.
 
-Before deployment, use `Test-ExistingDefaultFunctionHostKey` from
-`scripts/azure/Html2b.AzureDevValidation.psm1` for the existing-key preflight.
-It returns only the key name and pass status:
-
-```powershell
-Import-Module `
-    ./scripts/azure/Html2b.AzureDevValidation.psm1 `
-    -Force
-
-$keyPreflight = Test-ExistingDefaultFunctionHostKey `
-    -Subscription $subscriptionId `
-    -GroupName $resourceGroupName `
-    -AppName $functionAppName
-
-if ($keyPreflight.status -ne 'passed') {
-    throw 'The existing Function host key preflight failed.'
-}
-
-$keyPreflight = $null
-```
-
-After deployment, use
-`scripts/azure/Test-AzureDev.ps1` for the live matrix. The validator retrieves
-and uses the named existing host key internally and does not emit or persist
-the value. Do not reproduce the key-reading command in a transcript or pass a
-key on a command line.
-
-## Verify the Release
-
-Run `scripts/azure/Test-AzureDev.ps1` with non-secret identifiers and the
-expected immutable Render image held in the operator's session. The validator
-owns Function-key retrieval and use.
-
-Require this HTTP matrix:
-
-1. Functions liveness without a key returns `200` and `live`.
-2. Functions readiness and rendering without a key return `401` before trigger
-   execution and create no Render dependency.
-3. Keyed readiness returns `200` and `ready`. After scale-to-zero, an initial
-   `503`/`not-ready` may converge within the bounded validation interval.
-4. Keyed PNG, JPEG, and PDF requests return `200` with the documented media
-   type, attachment metadata, non-empty output, signature, and dimensions.
-5. Direct Render requests with no token, a malformed token, or a
-   wrong-audience token return `401`.
-6. If no separately authorized safe second-principal token is available,
-   record the wrong-principal check as skipped rather than claiming a `403`
-   result.
-
-Also require non-secret Azure readback:
-
-- The Function host is running with a system-assigned identity, the expected
-  Render HTTPS base URL, and an audience shaped as
-  `api://<render-api-client-id>`.
-- Container Apps authentication is enabled, requires HTTPS, validates the
-  exact audience and one Function principal, and has no excluded paths.
-- The active Render revision is healthy and uses the selected immutable image,
-  three container-port probes, the reviewed scale limits, and the expected
-  replica count.
-- No-key requests produce zero Render dependencies, while keyed readiness and
-  render requests produce qualifying dependencies.
-- A repeat full-payload What-If with the same inputs contains no unexplained
-  material change.
-
-Store command output and generated files only in ignored release-output
-locations.
+The deployment workflows complete after Azure accepts the Render revision
+update and Functions package deployment. They do not make post-deployment HTTP
+requests, retrieve Function keys, wait for cold starts, query telemetry, or
+assert live Azure resource state.
 
 ## Roll Back
 
 For a Function-edge failure, first deploy the immediately previous verified
 Functions ZIP while leaving Render authentication and the immutable Render
-image unchanged. Re-run the complete authorization, health, output, telemetry,
-and resource-state matrix. Inspect the predecessor package metadata before
-deployment. If it restores anonymous readiness or render triggers, the rollback
-temporarily reopens those public Functions routes; record and limit that
-exposure until the corrected Function-authorized package is redeployed.
+image unchanged. Inspect the predecessor package metadata before deployment.
+If it restores anonymous readiness or render triggers, the rollback temporarily
+reopens those public Functions routes; record and limit that exposure until the
+corrected Function-authorized package is redeployed.
 
 The application templates keep Container Apps authentication enabled and do
 not provide an authentication-disable rollback mode. Any emergency change that
@@ -260,12 +191,11 @@ shape and requires separate review and authorization.
 
 Use a coordinated two-host rollback only when the failed release changed both
 artifacts. Select the exact verified source and immutable artifact for each
-host, preview any infrastructure change, deploy in dependency order, and repeat
-the full release verification.
+host, preview any infrastructure change, and deploy in dependency order.
 
 Creating, rotating, or deleting Function keys and deleting identities, app
-registrations, revisions, images, evidence, or resources are separate
-operations, not rollback steps.
+registrations, revisions, images, or resources are separate operations, not
+rollback steps.
 
 ## Development Deployment Limits
 

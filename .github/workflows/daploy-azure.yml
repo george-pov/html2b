@@ -1,4 +1,4 @@
-name: Html2B Azure deployment
+name: Azure deployment
 
 on:
   push:
@@ -11,12 +11,6 @@ on:
       - scripts/github/Publish-Html2bFunctions.ps1
       - scripts/github/Publish-Html2bRender.ps1
       - scripts/github/Update-Html2bRender.ps1
-      - scripts/azure/Test-AzureDev.ps1
-      - scripts/azure/Html2b.AzureDevValidation.psm1
-      - scripts/azure/Html2b.AzureStateValidation.psm1
-      - scripts/azure/Html2b.HttpValidation.psm1
-      - scripts/azure/Html2b.OutputContracts.psm1
-      - scripts/azure/Html2b.TelemetryEvidence.psm1
       - .github/workflows/daploy-azure.yml
   workflow_dispatch:
     inputs:
@@ -73,12 +67,6 @@ jobs:
               'scripts/github/Publish-Html2bFunctions.ps1'
               'scripts/github/Publish-Html2bRender.ps1'
               'scripts/github/Update-Html2bRender.ps1'
-              'scripts/azure/Test-AzureDev.ps1'
-              'scripts/azure/Html2b.AzureDevValidation.psm1'
-              'scripts/azure/Html2b.AzureStateValidation.psm1'
-              'scripts/azure/Html2b.HttpValidation.psm1'
-              'scripts/azure/Html2b.OutputContracts.psm1'
-              'scripts/azure/Html2b.TelemetryEvidence.psm1'
               '.github/workflows/daploy-azure.yml'
           )
 
@@ -139,15 +127,6 @@ jobs:
           -OutputDirectory
           (Join-Path $PWD 'build/release/functions')
 
-      - name: Install Application Insights CLI extension
-        shell: pwsh
-        run: >-
-          az extension add
-          --name application-insights
-          --version 1.2.3
-          --yes
-          --only-show-errors
-
       - name: Log in to Azure
         uses: Azure/login@v3.0.0
         with:
@@ -195,59 +174,3 @@ jobs:
           app-name: ${{ vars.AZURE_FUNCTION_APP_NAME }}
           package: build/release/functions
           remote-build: false
-
-      - name: Validate deployment
-        id: validation
-        shell: pwsh
-        env:
-          TARGET_ENVIRONMENT: ${{ github.event_name == 'push' && 'dev' || inputs.target_environment }}
-          RENDER_IMAGE: ${{ steps.render-image.outputs.image }}
-          AZURE_SUBSCRIPTION_ID: ${{ vars.AZURE_SUBSCRIPTION_ID }}
-          AZURE_TENANT_ID: ${{ vars.AZURE_TENANT_ID }}
-          AZURE_RESOURCE_GROUP_NAME: ${{ vars.AZURE_RESOURCE_GROUP_NAME }}
-          AZURE_RENDER_REGISTRY_SERVER: ${{ format('{0}.azurecr.io', vars.AZURE_CONTAINER_REGISTRY_NAME) }}
-          AZURE_RENDER_IMAGE_REPOSITORY: ${{ vars.AZURE_RENDER_IMAGE_REPOSITORY }}
-          AZURE_RENDER_CONTAINER_APP_NAME: ${{ vars.AZURE_RENDER_CONTAINER_APP_NAME }}
-          AZURE_RENDER_IDENTITY_NAME: ${{ vars.AZURE_RENDER_IDENTITY_NAME }}
-          AZURE_FUNCTION_APP_NAME: ${{ vars.AZURE_FUNCTION_APP_NAME }}
-          AZURE_APPLICATION_INSIGHTS_NAME: ${{ vars.AZURE_APPLICATION_INSIGHTS_NAME }}
-          AZURE_RENDER_API_CLIENT_ID: ${{ vars.AZURE_RENDER_API_CLIENT_ID }}
-          AZURE_FUNCTION_INSTANCE_MEMORY_MB: ${{ vars.AZURE_FUNCTION_INSTANCE_MEMORY_MB }}
-          AZURE_FUNCTION_MAXIMUM_INSTANCE_COUNT: ${{ vars.AZURE_FUNCTION_MAXIMUM_INSTANCE_COUNT }}
-          AZURE_RENDER_CPU: ${{ vars.AZURE_RENDER_CPU }}
-          AZURE_RENDER_MEMORY: ${{ vars.AZURE_RENDER_MEMORY }}
-          AZURE_RENDER_MIN_REPLICAS: ${{ vars.AZURE_RENDER_MIN_REPLICAS }}
-          AZURE_RENDER_MAX_REPLICAS: ${{ vars.AZURE_RENDER_MAX_REPLICAS }}
-          AZURE_RENDER_HTTP_CONCURRENCY: ${{ vars.AZURE_RENDER_HTTP_CONCURRENCY }}
-        run: >-
-          ./scripts/azure/Test-AzureDev.ps1
-          -EnvironmentName $env:TARGET_ENVIRONMENT
-          -SubscriptionId $env:AZURE_SUBSCRIPTION_ID
-          -ExpectedTenantId $env:AZURE_TENANT_ID
-          -ResourceGroupName $env:AZURE_RESOURCE_GROUP_NAME
-          -FunctionAppName $env:AZURE_FUNCTION_APP_NAME
-          -RenderContainerAppName $env:AZURE_RENDER_CONTAINER_APP_NAME
-          -RenderApiClientId $env:AZURE_RENDER_API_CLIENT_ID
-          -RenderRegistryServer $env:AZURE_RENDER_REGISTRY_SERVER
-          -RenderImageRepository $env:AZURE_RENDER_IMAGE_REPOSITORY
-          -RenderIdentityName $env:AZURE_RENDER_IDENTITY_NAME
-          -ExpectedRenderImage $env:RENDER_IMAGE
-          -ApplicationInsightsName $env:AZURE_APPLICATION_INSIGHTS_NAME
-          -FunctionInstanceMemoryMB $env:AZURE_FUNCTION_INSTANCE_MEMORY_MB
-          -FunctionMaximumInstanceCount $env:AZURE_FUNCTION_MAXIMUM_INSTANCE_COUNT
-          -RenderCpu $env:AZURE_RENDER_CPU
-          -RenderMemory $env:AZURE_RENDER_MEMORY
-          -RenderMinReplicas $env:AZURE_RENDER_MIN_REPLICAS
-          -RenderMaxReplicas $env:AZURE_RENDER_MAX_REPLICAS
-          -RenderHttpConcurrency $env:AZURE_RENDER_HTTP_CONCURRENCY
-          -OutputDirectory
-          (Join-Path $PWD "build/validation/$($env:TARGET_ENVIRONMENT)/application")
-
-      - name: Upload sanitized validation summary
-        if: ${{ always() && steps.validation.outcome != 'skipped' }}
-        uses: actions/upload-artifact@v7.0.1
-        with:
-          name: html2b-azure-validation-${{ github.run_id }}-${{ github.run_attempt }}
-          path: build/validation/${{ github.event_name == 'push' && 'dev' || inputs.target_environment }}/application/validation-summary.json
-          if-no-files-found: error
-          retention-days: 7
