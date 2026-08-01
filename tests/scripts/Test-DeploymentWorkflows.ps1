@@ -51,10 +51,6 @@ Assert-Condition `
 $expectedApplicationPaths = @(
     'src/api/**'
     '.dockerignore'
-    'scripts/github/Resolve-Html2bDeploymentSource.ps1'
-    'scripts/github/Publish-Html2bFunctions.ps1'
-    'scripts/github/Publish-Html2bRender.ps1'
-    'scripts/github/Update-Html2bRender.ps1'
     '.github/workflows/daploy-azure.yml'
 )
 foreach ($path in $expectedApplicationPaths) {
@@ -99,6 +95,32 @@ Assert-Condition `
     -Condition ($applicationWorkflow.Contains('actions/setup-dotnet@v6.0.0') -and
         $applicationWorkflow.Contains('Azure/functions-action@v1.5.6')) `
     -Message 'Application workflow action references drifted.'
+Assert-Condition `
+    -Condition ($applicationWorkflow.Contains(
+        'src/api/Html2b.AzureFunctions/Html2b.AzureFunctions.csproj') -and
+        $applicationWorkflow.Contains('--output build/release/functions') -and
+        $applicationWorkflow.Contains('/p:UseAppHost=false')) `
+    -Message 'Application workflow no longer builds the expected Functions package.'
+Assert-Condition `
+    -Condition (-not $applicationWorkflow.Contains(
+        'Publish-Html2bFunctions.ps1')) `
+    -Message 'Application workflow retains the retired Functions publish script.'
+Assert-Condition `
+    -Condition ($applicationWorkflow.Contains('az acr build') -and
+        $applicationWorkflow.Contains('az acr repository show') -and
+        $applicationWorkflow.Contains('--query digest') -and
+        $applicationWorkflow.Contains('az containerapp update')) `
+    -Message 'Application workflow no longer deploys Render through a digest-qualified image.'
+foreach ($term in @(
+        'Publish-Html2bRender.ps1',
+        'Update-Html2bRender.ps1',
+        'render-image',
+        'latestReadyRevisionName',
+        'ReadinessTimeoutSeconds')) {
+    Assert-Condition `
+        -Condition (-not $applicationWorkflow.Contains($term)) `
+        -Message "Application workflow retains removed Render deployment term '$term'."
+}
 
 Assert-Condition `
     -Condition (-not $applicationWorkflow.Contains('pull_request:')) `
@@ -124,6 +146,14 @@ foreach ($relativePath in $deletedValidatorFiles) {
     Assert-Condition `
         -Condition (-not (Test-Path (Join-Path $repositoryRoot $relativePath))) `
         -Message "Removed validator file still exists: $relativePath"
+}
+
+foreach ($relativePath in @(
+        'scripts/github/Publish-Html2bRender.ps1',
+        'scripts/github/Update-Html2bRender.ps1')) {
+    Assert-Condition `
+        -Condition (-not (Test-Path (Join-Path $repositoryRoot $relativePath))) `
+        -Message "Removed Render deployment script still exists: $relativePath"
 }
 
 Write-Host 'Deployment workflow contracts passed.'
