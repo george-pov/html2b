@@ -38,10 +38,10 @@ $infrastructureScript = Get-Content `
     -Raw
 
 Assert-Condition `
-    -Condition ($applicationWorkflow -match '(?m)^\s{2}push:\r?\n\s{4}branches:\r?\n\s{6}- main$') `
+    -Condition ($applicationWorkflow -match '(?m)^\s{2}push:\r?\n\s{4}branches:\r?\n\s{6}- main\r?$') `
     -Message 'Application workflow no longer automatically deploys main.'
 Assert-Condition `
-    -Condition ($applicationWorkflow -match '(?m)^\s{2}workflow_dispatch:$') `
+    -Condition ($applicationWorkflow -match '(?m)^\s{2}workflow_dispatch:\r?$') `
     -Message 'Application workflow no longer supports manual dispatch.'
 Assert-Condition `
     -Condition ($applicationWorkflow -match [regex]::Escape(
@@ -51,18 +51,13 @@ Assert-Condition `
 $expectedApplicationPaths = @(
     'src/api/**'
     '.dockerignore'
-    'scripts/github/Resolve-Html2bDeploymentSource.ps1'
-    'scripts/github/Publish-Html2bFunctions.ps1'
-    'scripts/github/Publish-Html2bRender.ps1'
-    'scripts/github/Update-Html2bRender.ps1'
     '.github/workflows/daploy-azure.yml'
 )
 foreach ($path in $expectedApplicationPaths) {
     $escapedPath = [regex]::Escape($path)
     Assert-Condition `
-        -Condition (($applicationWorkflow -match "(?m)^\s+- $escapedPath$") -and
-            ($applicationWorkflow -match "(?m)^\s+'$escapedPath'$")) `
-        -Message "Application workflow is missing '$path' from a trigger or guard allowlist."
+        -Condition ($applicationWorkflow -match "(?m)^\s+- $escapedPath\r?$") `
+        -Message "Application workflow is missing '$path' from its trigger allowlist."
 }
 
 $validatorTerms = @(
@@ -100,6 +95,32 @@ Assert-Condition `
     -Condition ($applicationWorkflow.Contains('actions/setup-dotnet@v6.0.0') -and
         $applicationWorkflow.Contains('Azure/functions-action@v1.5.6')) `
     -Message 'Application workflow action references drifted.'
+Assert-Condition `
+    -Condition ($applicationWorkflow.Contains(
+        'src/api/Html2b.AzureFunctions/Html2b.AzureFunctions.csproj') -and
+        $applicationWorkflow.Contains('--output build/release/functions') -and
+        $applicationWorkflow.Contains('/p:UseAppHost=false')) `
+    -Message 'Application workflow no longer builds the expected Functions package.'
+Assert-Condition `
+    -Condition (-not $applicationWorkflow.Contains(
+        'Publish-Html2bFunctions.ps1')) `
+    -Message 'Application workflow retains the retired Functions publish script.'
+Assert-Condition `
+    -Condition ($applicationWorkflow.Contains('az acr build') -and
+        $applicationWorkflow.Contains('az acr repository show') -and
+        $applicationWorkflow.Contains('--query digest') -and
+        $applicationWorkflow.Contains('az containerapp update')) `
+    -Message 'Application workflow no longer deploys Render through a digest-qualified image.'
+foreach ($term in @(
+        'Publish-Html2bRender.ps1',
+        'Update-Html2bRender.ps1',
+        'render-image',
+        'latestReadyRevisionName',
+        'ReadinessTimeoutSeconds')) {
+    Assert-Condition `
+        -Condition (-not $applicationWorkflow.Contains($term)) `
+        -Message "Application workflow retains removed Render deployment term '$term'."
+}
 
 Assert-Condition `
     -Condition (-not $applicationWorkflow.Contains('pull_request:')) `
@@ -108,20 +129,6 @@ Assert-Condition `
     -Condition ($applicationWorkflow.Contains('queue: max') -and
         $infrastructureWorkflow.Contains('queue: max')) `
     -Message 'Deployment workflows must retain non-cancelling queues.'
-
-$mixedGuardIndex = $applicationWorkflow.IndexOf(
-    '- name: Block mixed application and Bicep changes',
-    [StringComparison]::Ordinal)
-$azureLoginIndex = $applicationWorkflow.IndexOf(
-    '- name: Log in to Azure',
-    [StringComparison]::Ordinal)
-Assert-Condition `
-    -Condition ($mixedGuardIndex -ge 0 -and $azureLoginIndex -gt $mixedGuardIndex) `
-    -Message 'Mixed application/Bicep guard must run before Azure login.'
-Assert-Condition `
-    -Condition ($applicationWorkflow.Contains(
-        'Automatic application deployment stopped because this push also changes ')) `
-    -Message 'Mixed application/Bicep guard must remain fail-closed.'
 
 Assert-Condition `
     -Condition (-not $infrastructureWorkflow.Contains('run_live_validation')) `
@@ -139,6 +146,14 @@ foreach ($relativePath in $deletedValidatorFiles) {
     Assert-Condition `
         -Condition (-not (Test-Path (Join-Path $repositoryRoot $relativePath))) `
         -Message "Removed validator file still exists: $relativePath"
+}
+
+foreach ($relativePath in @(
+        'scripts/github/Publish-Html2bRender.ps1',
+        'scripts/github/Update-Html2bRender.ps1')) {
+    Assert-Condition `
+        -Condition (-not (Test-Path (Join-Path $repositoryRoot $relativePath))) `
+        -Message "Removed Render deployment script still exists: $relativePath"
 }
 
 Write-Host 'Deployment workflow contracts passed.'
