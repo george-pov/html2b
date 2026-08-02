@@ -149,27 +149,24 @@ foreach ($term in @(
         -Message "Infrastructure workflow retains removed deployment term '$term'."
 }
 
-$deletedValidatorFiles = @(
+$removedRepositoryFiles = @(
+    'scripts/azure/Deploy-AzureDev.ps1'
+    'scripts/azure/Html2b.OutputContracts.psm1'
+    'scripts/azure/Publish-Html2bImage.ps1'
     'scripts/azure/Test-AzureDev.ps1'
     'scripts/azure/Html2b.AzureDevValidation.psm1'
     'scripts/azure/Html2b.AzureStateValidation.psm1'
     'scripts/azure/Html2b.HttpValidation.psm1'
     'scripts/azure/Html2b.TelemetryEvidence.psm1'
+    'scripts/github/Build-Html2bBicep.ps1'
+    'scripts/github/Publish-Html2bRender.ps1'
+    'scripts/github/Update-Html2bRender.ps1'
     'tests/scripts/Test-AzureDevValidation.ps1'
 )
-foreach ($relativePath in $deletedValidatorFiles) {
+foreach ($relativePath in $removedRepositoryFiles) {
     Assert-Condition `
         -Condition (-not (Test-Path (Join-Path $repositoryRoot $relativePath))) `
-        -Message "Removed validator file still exists: $relativePath"
-}
-
-foreach ($relativePath in @(
-        'scripts/github/Publish-Html2bRender.ps1',
-        'scripts/github/Update-Html2bRender.ps1',
-        'scripts/github/Build-Html2bBicep.ps1')) {
-    Assert-Condition `
-        -Condition (-not (Test-Path (Join-Path $repositoryRoot $relativePath))) `
-        -Message "Removed Render deployment script still exists: $relativePath"
+        -Message "Removed repository file still exists: $relativePath"
 }
 
 Write-Host 'Deployment workflow contracts passed.'

@@ -31,10 +31,6 @@ repository-scoped image access.
 The tracked environment parameters supply the non-secret Render API client ID;
 the Microsoft Entra app registration and service principal already exist.
 
-`scripts/azure/Deploy-AzureDev.ps1` and
-`scripts/azure/Publish-Html2bImage.ps1` do not support the current
-Functions-plus-Render topology and are not release commands for it.
-
 ## Prerequisites
 
 - PowerShell 7.3 or later.
