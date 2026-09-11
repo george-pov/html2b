@@ -2,33 +2,24 @@ targetScope = 'resourceGroup'
 
 param location string
 param baseTags object
-param containerRegistryName string
+param containerRegistryId string
+param registryServer string
 param imageRepositoryName string
-param containerAppsEnvironmentName string
+param containerEnvId string
 param renderIdentityName string
 param renderContainerAppName string
-param containerImage string
-param renderCpu int
-param renderMemory string
-param renderMinReplicas int
-param renderMaxReplicas int
-param renderHttpConcurrency int
 
-var repositoryReaderRoleDefinitionResourceId = subscriptionResourceId(
+var repoReaderRoleId = subscriptionResourceId(
   'Microsoft.Authorization/roleDefinitions',
   'b93aa761-3e63-49ed-ac28-beffa264f7ac'
 )
-var renderRepositoryReaderCondition = '((!(ActionMatches{\'Microsoft.ContainerRegistry/registries/repositories/content/read\'}) AND !(ActionMatches{\'Microsoft.ContainerRegistry/registries/repositories/metadata/read\'})) OR (@Request[Microsoft.ContainerRegistry/registries/repositories:name] StringEqualsIgnoreCase \'${imageRepositoryName}\'))'
+var renderReaderCondition = '((!(ActionMatches{\'Microsoft.ContainerRegistry/registries/repositories/content/read\'}) AND !(ActionMatches{\'Microsoft.ContainerRegistry/registries/repositories/metadata/read\'})) OR (@Request[Microsoft.ContainerRegistry/registries/repositories:name] StringEqualsIgnoreCase \'${imageRepositoryName}\'))'
 var renderTags = union(baseTags, {
   Component: 'Render'
 })
 
 resource containerRegistry 'Microsoft.ContainerRegistry/registries@2025-11-01' existing = {
-  name: containerRegistryName
-}
-
-resource containerAppsEnvironment 'Microsoft.App/managedEnvironments@2026-01-01' existing = {
-  name: containerAppsEnvironmentName
+  name: last(split(containerRegistryId, '/'))
 }
 
 resource renderIdentity 'Microsoft.ManagedIdentity/userAssignedIdentities@2024-11-30' = {
@@ -37,21 +28,21 @@ resource renderIdentity 'Microsoft.ManagedIdentity/userAssignedIdentities@2024-1
   tags: renderTags
 }
 
-resource renderAcrRepositoryReaderRoleAssignment 'Microsoft.Authorization/roleAssignments@2022-04-01' = {
+resource renderRepoReaderRole 'Microsoft.Authorization/roleAssignments@2022-04-01' = {
   name: guid(
     containerRegistry.id,
     renderIdentity.id,
-    repositoryReaderRoleDefinitionResourceId,
+    repoReaderRoleId,
     imageRepositoryName
   )
   scope: containerRegistry
   properties: {
     principalId: renderIdentity.properties.principalId
     principalType: 'ServicePrincipal'
-    roleDefinitionId: repositoryReaderRoleDefinitionResourceId
-    condition: renderRepositoryReaderCondition
+    roleDefinitionId: repoReaderRoleId
+    condition: renderReaderCondition
     conditionVersion: '2.0'
-    description: 'Read Html2B images only from the ${imageRepositoryName} repository.'
+    description: 'Read Html2B images only from ${registryServer}/${imageRepositoryName}.'
   }
 }
 
@@ -66,7 +57,7 @@ resource renderContainerApp 'Microsoft.App/containerApps@2026-01-01' = {
     }
   }
   properties: {
-    managedEnvironmentId: containerAppsEnvironment.id
+    managedEnvironmentId: containerEnvId
     configuration: {
       activeRevisionsMode: 'Single'
       maxInactiveRevisions: 100
@@ -79,7 +70,7 @@ resource renderContainerApp 'Microsoft.App/containerApps@2026-01-01' = {
       ingress: {
         external: true
         allowInsecure: false
-        targetPort: 8080
+        targetPort: 80
         transport: 'auto'
         exposedPort: 0
         traffic: [
@@ -89,68 +80,21 @@ resource renderContainerApp 'Microsoft.App/containerApps@2026-01-01' = {
           }
         ]
       }
-      registries: [
-        {
-          server: '${containerRegistryName}.azurecr.io'
-          identity: renderIdentity.id
-        }
-      ]
     }
     template: {
       containers: [
         {
           name: 'html2b-render'
-          image: containerImage
+          image: 'mcr.microsoft.com/k8se/quickstart:latest'
           resources: {
-            cpu: renderCpu
-            memory: renderMemory
+            cpu: json('0.25')
+            memory: '0.5Gi'
           }
-          probes: [
-            {
-              type: 'Liveness'
-              httpGet: {
-                path: '/health/live'
-                port: 8080
-                scheme: 'HTTP'
-              }
-              initialDelaySeconds: 10
-              periodSeconds: 30
-              timeoutSeconds: 5
-              failureThreshold: 3
-              successThreshold: 1
-            }
-            {
-              type: 'Readiness'
-              httpGet: {
-                path: '/health/ready'
-                port: 8080
-                scheme: 'HTTP'
-              }
-              initialDelaySeconds: 1
-              periodSeconds: 5
-              timeoutSeconds: 5
-              failureThreshold: 3
-              successThreshold: 1
-            }
-            {
-              type: 'Startup'
-              httpGet: {
-                path: '/health/ready'
-                port: 8080
-                scheme: 'HTTP'
-              }
-              initialDelaySeconds: 1
-              periodSeconds: 5
-              timeoutSeconds: 5
-              failureThreshold: 10
-              successThreshold: 1
-            }
-          ]
         }
       ]
       scale: {
-        minReplicas: renderMinReplicas
-        maxReplicas: renderMaxReplicas
+        minReplicas: 0
+        maxReplicas: 1
         pollingInterval: 30
         cooldownPeriod: 300
         rules: [
@@ -158,7 +102,7 @@ resource renderContainerApp 'Microsoft.App/containerApps@2026-01-01' = {
             name: 'http-one-render'
             http: {
               metadata: {
-                concurrentRequests: string(renderHttpConcurrency)
+                concurrentRequests: '1'
               }
             }
           }
@@ -168,7 +112,7 @@ resource renderContainerApp 'Microsoft.App/containerApps@2026-01-01' = {
     }
   }
   dependsOn: [
-    renderAcrRepositoryReaderRoleAssignment
+    renderRepoReaderRole
   ]
 }
 

@@ -2,12 +2,12 @@ targetScope = 'resourceGroup'
 
 param location string
 param baseTags object
-param logAnalyticsWorkspaceName string
-param functionStorageAccountName string
+param logWorkspaceId string
+param functionStorageName string
 param functionPlanName string
 param applicationInsightsName string
 param functionAppName string
-param functionDeploymentContainerName string
+param functionReleaseContainer string
 param functionRuntime string
 param functionRuntimeVersion string
 @allowed([
@@ -18,21 +18,17 @@ param functionRuntimeVersion string
 param functionInstanceMemoryMb int
 @minValue(1)
 @maxValue(1000)
-param functionMaximumInstanceCount int
+param functionMaxInstances int
 param renderServiceBaseUrl string
 param renderServiceAudience string
 
 var functionTags = union(baseTags, {
   Component: 'Functions'
 })
-var functionStorageConnectionString = 'DefaultEndpointsProtocol=https;AccountName=${functionStorage.name};AccountKey=${functionStorage.listKeys().keys[0].value};EndpointSuffix=${environment().suffixes.storage}'
-
-resource logAnalyticsWorkspace 'Microsoft.OperationalInsights/workspaces@2025-02-01' existing = {
-  name: logAnalyticsWorkspaceName
-}
+var storageConnection = 'DefaultEndpointsProtocol=https;AccountName=${functionStorage.name};AccountKey=${functionStorage.listKeys().keys[0].value};EndpointSuffix=${environment().suffixes.storage}'
 
 resource functionStorage 'Microsoft.Storage/storageAccounts@2025-08-01' = {
-  name: functionStorageAccountName
+  name: functionStorageName
   location: location
   tags: functionTags
   sku: {
@@ -56,9 +52,9 @@ resource functionBlobService 'Microsoft.Storage/storageAccounts/blobServices@202
   properties: {}
 }
 
-resource functionDeploymentContainer 'Microsoft.Storage/storageAccounts/blobServices/containers@2025-08-01' = {
+resource releaseContainer 'Microsoft.Storage/storageAccounts/blobServices/containers@2025-08-01' = {
   parent: functionBlobService
-  name: functionDeploymentContainerName
+  name: functionReleaseContainer
   properties: {
     publicAccess: 'None'
   }
@@ -87,7 +83,7 @@ resource applicationInsights 'Microsoft.Insights/components@2020-02-02' = {
     Application_Type: 'web'
     Flow_Type: 'Bluefield'
     Request_Source: 'rest'
-    WorkspaceResourceId: logAnalyticsWorkspace.id
+    WorkspaceResourceId: logWorkspaceId
   }
 }
 
@@ -110,11 +106,11 @@ resource functionApp 'Microsoft.Web/sites@2024-04-01' = {
       appSettings: [
         {
           name: 'AzureWebJobsStorage'
-          value: functionStorageConnectionString
+          value: storageConnection
         }
         {
           name: 'DEPLOYMENT_STORAGE_CONNECTION_STRING'
-          value: functionStorageConnectionString
+          value: storageConnection
         }
         {
           name: 'APPLICATIONINSIGHTS_CONNECTION_STRING'
@@ -134,7 +130,7 @@ resource functionApp 'Microsoft.Web/sites@2024-04-01' = {
       deployment: {
         storage: {
           type: 'blobContainer'
-          value: '${functionStorage.properties.primaryEndpoints.blob}${functionDeploymentContainerName}'
+          value: '${functionStorage.properties.primaryEndpoints.blob}${functionReleaseContainer}'
           authentication: {
             type: 'StorageAccountConnectionString'
             storageAccountConnectionStringName: 'DEPLOYMENT_STORAGE_CONNECTION_STRING'
@@ -143,7 +139,7 @@ resource functionApp 'Microsoft.Web/sites@2024-04-01' = {
       }
       scaleAndConcurrency: {
         instanceMemoryMB: functionInstanceMemoryMb
-        maximumInstanceCount: functionMaximumInstanceCount
+        maximumInstanceCount: functionMaxInstances
       }
       runtime: {
         name: functionRuntime
@@ -152,10 +148,10 @@ resource functionApp 'Microsoft.Web/sites@2024-04-01' = {
     }
   }
   dependsOn: [
-    functionDeploymentContainer
+    releaseContainer
   ]
 }
 
 output functionAppName string = functionApp.name
-output functionAppDefaultHostName string = functionApp.properties.defaultHostName
+output functionHostName string = functionApp.properties.defaultHostName
 output functionPrincipalId string = functionApp.identity.principalId

@@ -8,6 +8,7 @@ on:
       - src/api/**
       - .dockerignore
       - .github/workflows/daploy-azure.yml
+      - deployment/azure/render-app.yaml
   workflow_dispatch:
     inputs:
       target_environment:
@@ -71,15 +72,23 @@ jobs:
           AZURE_RENDER_IMAGE_REPOSITORY: ${{ vars.AZURE_RENDER_IMAGE_REPOSITORY }}
           AZURE_RESOURCE_GROUP_NAME: ${{ vars.AZURE_RESOURCE_GROUP_NAME }}
           AZURE_RENDER_CONTAINER_APP_NAME: ${{ vars.AZURE_RENDER_CONTAINER_APP_NAME }}
+          AZURE_RENDER_IDENTITY_NAME: ${{ vars.AZURE_RENDER_IDENTITY_NAME }}
         run: |
           $ErrorActionPreference = 'Stop'
           $PSNativeCommandUseErrorActionPreference = $true
 
-          $tag = "$env:AZURE_RENDER_IMAGE_REPOSITORY`:$env:GITHUB_SHA"
+          if ($env:AZURE_CONTAINER_REGISTRY_NAME -notmatch '^[a-z0-9]+$') {
+            throw 'The selected registry name must be lowercase alphanumeric.'
+          }
+          if ($env:AZURE_RENDER_IMAGE_REPOSITORY -notmatch '^[a-z0-9._/-]+$') {
+            throw 'The selected image repository must be lowercase.'
+          }
+
+          $imageTag = "$env:AZURE_RENDER_IMAGE_REPOSITORY`:$env:GITHUB_SHA"
           az acr build `
             --subscription $env:AZURE_SUBSCRIPTION_ID `
             --registry $env:AZURE_CONTAINER_REGISTRY_NAME `
-            --image $tag `
+            --image $imageTag `
             --file src/api/Html2b.Render/Dockerfile `
             --source-acr-auth-id '[caller]' `
             --only-show-errors `
@@ -90,23 +99,73 @@ jobs:
             az acr repository show `
               --subscription $env:AZURE_SUBSCRIPTION_ID `
               --name $env:AZURE_CONTAINER_REGISTRY_NAME `
-              --image $tag `
+              --image $imageTag `
               --query digest `
               --output tsv `
               --only-show-errors
           ).Trim()
 
-          $image = (
+          $imageRef = (
             "$env:AZURE_CONTAINER_REGISTRY_NAME.azurecr.io/" +
             "$env:AZURE_RENDER_IMAGE_REPOSITORY@$digest"
           )
+          $registryServer = "$env:AZURE_CONTAINER_REGISTRY_NAME.azurecr.io"
+          $expectedImage = '^{0}/{1}@sha256:[a-f0-9]{{64}}$' -f `
+            [regex]::Escape($registryServer), `
+            [regex]::Escape($env:AZURE_RENDER_IMAGE_REPOSITORY)
+          if ($imageRef -cnotmatch $expectedImage) {
+            throw 'ACR returned an invalid digest-qualified Render image.'
+          }
+
+          $identityId = (
+            az identity show `
+              --subscription $env:AZURE_SUBSCRIPTION_ID `
+              --resource-group $env:AZURE_RESOURCE_GROUP_NAME `
+              --name $env:AZURE_RENDER_IDENTITY_NAME `
+              --query id `
+              --output tsv `
+              --only-show-errors
+          ).Trim()
+          if ([string]::IsNullOrWhiteSpace($identityId)) {
+            throw 'The selected Render identity has no resource ID.'
+          }
+          $expectedIdentity = (
+            '^/subscriptions/{0}/resourceGroups/{1}/providers/' +
+            'Microsoft\.ManagedIdentity/userAssignedIdentities/{2}$'
+          ) -f `
+            [regex]::Escape($env:AZURE_SUBSCRIPTION_ID), `
+            [regex]::Escape($env:AZURE_RESOURCE_GROUP_NAME), `
+            [regex]::Escape($env:AZURE_RENDER_IDENTITY_NAME)
+          if ($identityId -notmatch $expectedIdentity) {
+            throw 'Azure returned an unexpected Render identity resource ID.'
+          }
+
+          $yamlTemplate = Join-Path `
+            $env:GITHUB_WORKSPACE `
+            'deployment/azure/render-app.yaml'
+          $yamlPath = Join-Path $env:RUNNER_TEMP 'render-app.yaml'
+          $yaml = Get-Content -LiteralPath $yamlTemplate -Raw
+          $tokens = [ordered] @{
+            '__RENDER_IMAGE__' = $imageRef
+            '__RENDER_ID__' = $identityId
+            '__ACR_SERVER__' = $registryServer
+          }
+          foreach ($token in $tokens.Keys) {
+            if ([regex]::Matches($yaml, [regex]::Escape($token)).Count -ne 1) {
+              throw "Render YAML must contain '$token' exactly once."
+            }
+            $yaml = $yaml.Replace($token, $tokens[$token])
+          }
+          if ($yaml -match '__[A-Z0-9_]+__') {
+            throw 'Render YAML contains an unresolved placeholder.'
+          }
+          [System.IO.File]::WriteAllText($yamlPath, $yaml)
 
           az containerapp update `
             --subscription $env:AZURE_SUBSCRIPTION_ID `
             --resource-group $env:AZURE_RESOURCE_GROUP_NAME `
             --name $env:AZURE_RENDER_CONTAINER_APP_NAME `
-            --container-name html2b-render `
-            --image $image `
+            --yaml $yamlPath `
             --only-show-errors `
             --output none
 
