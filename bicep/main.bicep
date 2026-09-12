@@ -12,6 +12,7 @@ param deploymentIdentityName string
 param githubCredentialName string
 param githubRepository string
 param githubEnvironmentName string
+param deployWriterRoleName string
 param functionStorageName string
 param functionPlanName string
 param applicationInsightsName string
@@ -81,6 +82,7 @@ module deployIdentityModule 'modules/deploy-identity.bicep' = {
     containerRegistryName: platformDeployment.outputs.containerRegistryName
     containerRegistryId: platformDeployment.outputs.containerRegistryId
     imageRepositoryName: imageRepositoryName
+    deployWriterRoleName: deployWriterRoleName
   }
 }
 

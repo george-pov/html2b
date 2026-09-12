@@ -9,6 +9,7 @@ param githubEnvironmentName string
 param containerRegistryName string
 param containerRegistryId string
 param imageRepositoryName string
+param deployWriterRoleName string
 
 var contributorRoleId = subscriptionResourceId(
   'Microsoft.Authorization/roleDefinitions',
@@ -23,7 +24,7 @@ var tokenExchangeAudience = 'api://AzureADTokenExchange'
 var deployWriterCondition = '((!(ActionMatches{\'Microsoft.ContainerRegistry/registries/repositories/content/read\'}) AND !(ActionMatches{\'Microsoft.ContainerRegistry/registries/repositories/content/write\'}) AND !(ActionMatches{\'Microsoft.ContainerRegistry/registries/repositories/metadata/read\'}) AND !(ActionMatches{\'Microsoft.ContainerRegistry/registries/repositories/metadata/write\'})) OR (@Request[Microsoft.ContainerRegistry/registries/repositories:name] StringEqualsIgnoreCase \'${imageRepositoryName}\'))'
 
 resource containerRegistry 'Microsoft.ContainerRegistry/registries@2025-11-01' existing = {
-  name: containerRegistryName
+  name: last(split(containerRegistryId, '/'))
 }
 
 resource deploymentIdentity 'Microsoft.ManagedIdentity/userAssignedIdentities@2024-11-30' = {
@@ -57,7 +58,7 @@ resource deployContributorRole 'Microsoft.Authorization/roleAssignments@2022-04-
 }
 
 resource deployRepoWriterRole 'Microsoft.Authorization/roleAssignments@2022-04-01' = {
-  name: guid(containerRegistryId, deploymentIdentity.id, repoWriterRoleId, imageRepositoryName)
+  name: deployWriterRoleName
   scope: containerRegistry
   properties: {
     principalId: deploymentIdentity.properties.principalId
@@ -65,7 +66,7 @@ resource deployRepoWriterRole 'Microsoft.Authorization/roleAssignments@2022-04-0
     roleDefinitionId: repoWriterRoleId
     condition: deployWriterCondition
     conditionVersion: '2.0'
-    description: 'Write Html2B images only in the ${imageRepositoryName} repository.'
+    description: 'Write Html2B images only in ${containerRegistryName}/${imageRepositoryName}.'
   }
 }
 
