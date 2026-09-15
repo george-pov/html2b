@@ -35,3 +35,6 @@ packages/
 /build
 .vscode
 /.playwright-cli/
+
+.angular/
+node_modules/
