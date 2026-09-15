@@ -1,35 +1,39 @@
 # Azure Development Deployment
 
-Html2B uses an operator-driven Azure release. Bicep provisions the application
-infrastructure, Azure Container Registry builds the Render image, and the
-Functions package is deployed separately. Each changed artifact is produced
-from clean source and recorded with its immutable identity. A Function-only
-release retains the deployed immutable Render image; a release
-that changes both hosts builds both artifacts from the same clean revision.
+Html2B uses three deliberate operator actions to create or recover its Azure
+development environment:
 
-This guide intentionally contains no environment-specific identifiers,
-resource names, hostnames, release hashes, artifact digests, or deployment
-outputs. Resolve those values from the selected Azure context, tracked
-environment parameters, and command output during the release.
+1. preview and apply the complete infrastructure with Azure CLI and Bicep;
+2. link the recreated deployment identity to the existing GitHub Environment;
+3. dispatch the GitHub application workflow.
+
+Bicep creates the resource group and the Azure resources required by the
+application. It leaves Render on a public Azure quickstart container. The
+application workflow builds the real Render image, applies the tracked
+Container Apps configuration, and then deploys Functions. Html2B can be
+unavailable between the Bicep Apply and successful application deployment.
+
+This guide contains no environment-specific identifiers, resource names,
+hostnames, release hashes, image digests, deployment outputs, or credentials.
+Resolve those values from the selected CLI contexts, tracked parameters, and
+command output while operating the environment.
 
 ## Repository Sources
 
-- `bicep/main.bicep` composes the application infrastructure.
-- `bicep/environments/dev.bicepparam` contains tracked development parameters.
-  It reads the release-specific immutable Render image from the operator's
-  `HTML2B_CONTAINER_IMAGE` environment variable.
-- `bicep/modules/` contains the Functions and Render resource definitions.
-- `src/api/Html2b.Render/Dockerfile` builds the Render image.
-- `src/api/Html2b.AzureFunctions/Html2b.AzureFunctions.csproj` builds the
-  Functions package.
+- `bicep/main.bicep` is the subscription-scope infrastructure entry point.
+- `bicep/environments/dev.bicepparam` contains the tracked development
+  parameters.
+- `bicep/modules/` contains the owned platform, identity, Functions, Render,
+  and authentication resources.
+- `scripts/azure/Set-GitHubIdentity.ps1` performs only the GitHub identity-link
+  step.
+- `deployment/azure/render-app.yaml` is the complete real Render revision
+  configuration.
+- `.github/workflows/daploy-azure.yml` builds and deploys the application.
 
-The deployment uses existing shared registry, logging, and Container Apps
-environment resources. The application templates create or update the
-Functions resources and system identity, Render user-assigned image-pull
-identity and Container App, Container Apps authentication, and required
-repository-scoped image access.
-The tracked environment parameters supply the non-secret Render API client ID;
-the Microsoft Entra app registration and service principal already exist.
+The Microsoft Entra application used to protect Render and the GitHub
+Environment are external prerequisites. They are not created by Bicep and are
+not removed when the Azure resource group is deleted.
 
 ## Prerequisites
 
@@ -37,173 +41,240 @@ the Microsoft Entra app registration and service principal already exist.
 - Git.
 - .NET 10 SDK.
 - Azure CLI with Bicep.
-- An Azure CLI session with permission to validate and apply the templates,
-  build in the registry, publish the Functions package, and manage the Render
-  image-pull role assignment.
-- Existing repository-scoped registry Writer access for the signed-in operator.
-- A clean Git working tree at the source revision being released.
+- GitHub CLI.
+- An authenticated `az` session with permission to deploy the resources and
+  role assignments described by the template.
+- An authenticated `gh` session with permission to update variables and run
+  workflows in the selected repository and Environment.
+- An existing Render Microsoft Entra application and GitHub Environment that
+  match the tracked configuration.
+- A clean, retrievable source revision on a branch allowed by the GitHub
+  Environment.
 
-Keep subscription, tenant, operator, resource, host, and artifact values in the
-operator's session or ignored release output. Do not add them to source files
-or this guide.
+Keep identifiers, CLI output, keys, tokens, connection strings, and generated
+artifacts in memory or ignored operator output. Do not add them to source or
+documentation.
 
-## Validate the Repository Sources
+## Validate the Source
 
-From the repository root:
+Run from the repository root:
 
 ```powershell
+git status --short
+git rev-parse HEAD
+
 dotnet restore src/api/Html2b.slnx
 dotnet build src/api/Html2b.slnx --configuration Release --no-restore
 dotnet test src/api/Html2b.slnx --configuration Release --no-build
 dotnet format src/api/Html2b.slnx --verify-no-changes --no-restore
 
-az bicep build --file bicep/main.bicep --stdout | Out-Null
-```
+az bicep build `
+    --file bicep/main.bicep `
+    --stdout `
+    --only-show-errors |
+    Out-Null
 
-Stop if restore, build, tests, formatting, or Bicep compilation fails. Compile
-the environment parameters after selecting the immutable Render image.
-
-## Select and Verify the Azure Context
-
-1. Sign in with Azure CLI.
-2. List the available subscriptions.
-3. Select the development subscription in the local shell.
-4. Read the active account back from Azure CLI and verify it before continuing.
-5. Confirm that the shared resources referenced by the tracked environment
-   parameters exist.
-6. Read the Render API client ID from the selected tracked environment
-   parameters without copying it into this guide.
-
-Do not copy values returned by these checks into documentation or tracked
-files.
-
-## Verify the Authentication Inputs
-
-The deployment derives the Functions setting `RenderService__Audience` as
-`api://<render-api-client-id>`. Infrastructure requests the corresponding
-`api://<render-api-client-id>/.default` scope with the Function host's
-system-assigned managed identity.
-
-Container Apps authentication uses the version 2 tenant issuer, validates the
-GUID client ID as the token audience, and permits the configured Function
-principal. It has no excluded paths. Confirm those shapes from the compiled
-template and selected Azure context without saving identifier values in
-tracked output.
-
-## Choose the Release Shape
-
-- For a Function-only change, supply the known currently deployed immutable
-  Render image digest and build only the Functions ZIP from its exact clean
-  source.
-- When Render changes, build a new immutable Render image. When both hosts
-  change together, build the image and Functions ZIP from the same clean
-  revision.
-
-Record the selected image digest, Functions source revision, ZIP checksum, and
-their verified compatibility in ignored release output.
-
-Set `HTML2B_CONTAINER_IMAGE` in the operator's session to the complete
-digest-qualified image reference, then compile the environment parameters:
-
-```powershell
 az bicep build-params `
     --file bicep/environments/dev.bicepparam `
-    --stdout |
+    --stdout `
+    --only-show-errors |
     Out-Null
 ```
 
-Stop if parameter compilation fails.
+Stop if the selected source is not the intended clean revision or any relevant
+check fails. Do not substitute a locally modified workflow for the revision
+that GitHub will run.
 
-## Prepare the Render Image
+## Select and Verify the Operator Context
 
-Perform these steps only when the release changes Render:
+Collect the intended values in the current PowerShell session. The values
+below are prompts, not repository defaults:
 
-1. Create a clean source archive from the exact Git revision being released.
-2. Build the Render Dockerfile through Azure Container Registry using that
-   clean archive as the build context.
-3. Tag the build with the full source revision.
-4. Resolve the resulting immutable manifest digest from the registry.
-5. Keep the source revision and resolved digest together in ignored release
-   output.
+```powershell
+$subscriptionId = Read-Host 'Azure subscription ID'
+$location = Read-Host 'Azure deployment location'
+$deploymentName = Read-Host 'Azure deployment name'
+$resourceGroup = Read-Host 'Azure resource group name'
+$deploymentIdentity = Read-Host 'Azure deployment identity name'
+$repository = Read-Host 'GitHub repository in owner/name form'
+$environmentName = Read-Host 'GitHub Environment name'
+$sourceRef = Read-Host 'Git branch or tag to deploy'
 
-Repository-scoped registry Writer access is an operator prerequisite. The
-application templates do not grant or migrate deployment-operator access.
+az account set --subscription $subscriptionId
+az account show --output table
+gh auth status
+gh repo view $repository
+```
 
-## Prepare the Functions Package
+Verify the active Azure subscription, GitHub account, repository, Environment,
+source ref, and intended resource group before any write. The identity-link
+script repeats the Azure and GitHub target checks before changing the fixed
+`AZURE_INFRA_CLIENT_ID` Environment variable.
 
-1. Publish the Functions project in Release configuration from its exact clean
-   source revision.
-2. Confirm that `host.json` is at the publish-output root.
-3. Confirm that local settings are absent from the publish output.
-4. Create the deployment ZIP from the publish-output contents.
-5. Calculate the ZIP checksum and keep it with the ignored release output.
-6. Verify that the immediately previous Functions ZIP, source revision, and
-   checksum remain available as the executable rollback.
+## Preview and Apply Bicep
 
-For a Function-only release, also record the unchanged immutable Render image
-that was used for compatibility validation.
+Preview the complete subscription deployment:
 
-## Preview and Apply the Infrastructure
+```powershell
+az deployment sub what-if `
+    --subscription $subscriptionId `
+    --name $deploymentName `
+    --location $location `
+    --template-file bicep/main.bicep `
+    --parameters bicep/environments/dev.bicepparam `
+    --result-format FullResourcePayloads `
+    --only-show-errors
+```
 
-1. Validate the subscription-scope application template with the tracked
-   development parameters and the currently selected immutable Render image.
-2. Save a full Bicep What-If result outside tracked source.
-3. Review every create, modify, and delete operation.
-4. Stop when the preview targets an unexpected resource or includes an
-   unexplained destructive change.
-5. Apply only the intended infrastructure changes with the same inputs reviewed
-   by What-If. A Function-only package release requires no Bicep apply when the
-   preview contains no intended infrastructure change.
+Review every Create, Modify, Delete, and Ignore entry. Confirm the deployment
+targets only the intended resource group and required children. Stop on an
+unexpected resource, unexplained deletion, role expansion, or
+credential-shaped output.
 
-Do not replace the reviewed image input or environment parameters between the
-preview and apply commands.
+Apply the exact template, parameters, location, subscription, and deployment
+name that were reviewed:
 
-## Publish the Functions Package
+```powershell
+az deployment sub create `
+    --subscription $subscriptionId `
+    --name $deploymentName `
+    --location $location `
+    --template-file bicep/main.bicep `
+    --parameters bicep/environments/dev.bicepparam `
+    --only-show-errors
+```
 
-Immediately before deployment, recheck the clean source revision, exact ZIP
-checksum, selected Azure context, and verified previous Functions ZIP. Publish
-only the prepared ZIP to the Functions host resolved in the local shell.
+Read the deployment and resource group back before continuing. Bicep creates
+Render with the Azure quickstart image and bootstrap port. That revision proves
+the Container App can start; it is not Html2B readiness. Applying Bicep again
+also intentionally returns Render to this bootstrap configuration, so run the
+application workflow afterward whenever Html2B must be restored.
 
-The infrastructure workflow completes after Azure accepts the Bicep Apply. It
-requires an explicit digest-qualified Render image for every run, performs a
-What-If that blocks Apply when it includes a deletion, and does not make
-post-Apply Azure resource readback checks. Application deployment completes
-after Azure accepts the Render revision update and Functions package
-deployment. It does not make post-deployment HTTP requests, retrieve Function
-keys, wait for cold starts, query telemetry, or assert live Azure resource
-state.
+## Link the Recreated Identity
 
-## Roll Back
+Run the link script only after Bicep succeeds:
 
-For a Function-edge failure, first deploy the immediately previous verified
-Functions ZIP while leaving Render authentication and the immutable Render
-image unchanged. Inspect the predecessor package metadata before deployment.
-If it restores anonymous readiness or render triggers, the rollback temporarily
-reopens those public Functions routes; record and limit that exposure until the
-corrected Function-authorized package is redeployed.
+```powershell
+pwsh scripts/azure/Set-GitHubIdentity.ps1 `
+    -SubscriptionId $subscriptionId `
+    -ResourceGroupName $resourceGroup `
+    -DeploymentIdentityName $deploymentIdentity `
+    -Repository $repository `
+    -EnvironmentName $environmentName
+```
 
-The application templates keep Container Apps authentication enabled and do
-not provide an authentication-disable rollback mode. Any emergency change that
-reopens direct anonymous Render access is outside the repository deployment
-shape and requires separate review and authorization.
+The script does not sign in, deploy Bicep, build an artifact, or dispatch a
+workflow. It validates the existing `az` and `gh` sessions, resolves the
+recreated identity, writes only `AZURE_INFRA_CLIENT_ID` in the selected GitHub
+Environment, and verifies the saved value. If it fails, correct the active CLI
+session, permissions, or target values and rerun only this step.
 
-Use a coordinated two-host rollback only when the failed release changed both
-artifacts. Select the exact verified source and immutable artifact for each
-host, preview any infrastructure change, and deploy in dependency order.
+## Deploy the Application
 
-Creating, rotating, or deleting Function keys and deleting identities, app
-registrations, revisions, images, or resources are separate operations, not
-rollback steps.
+Dispatch the tracked application workflow from the clean source ref:
+
+```powershell
+gh workflow run daploy-azure.yml `
+    --repo $repository `
+    --ref $sourceRef `
+    -f "target_environment=$environmentName"
+```
+
+Monitor the resulting run and record its non-secret run and source identity.
+The workflow:
+
+1. builds the Functions package from the selected source;
+2. signs in to Azure with GitHub OIDC and the linked deployment identity;
+3. builds the Render image in Azure Container Registry using the exact source
+   revision as its tag;
+4. resolves the immutable image digest;
+5. substitutes only that digest, the Render identity resource ID, and the
+   registry server into a temporary copy of the tracked Render YAML;
+6. applies the complete Render configuration; and
+7. deploys Functions last.
+
+The workflow never invokes Bicep. It preserves Render authentication and
+applies port 8080, the health probes, resources, scale settings, identity,
+registry, secure ingress, and single-revision traffic from the tracked YAML.
+
+## Verify the Deployment
+
+After the workflow succeeds, verify:
+
+- all expected Azure resources report a successful state;
+- the deployment identity has the exact GitHub federation, resource-group
+  Contributor, and repository-conditioned registry Writer assignment;
+- the Render identity has only its repository-conditioned registry Reader;
+- the source tag resolves to the immutable digest used by the active Render
+  revision;
+- the live Container App matches `deployment/azure/render-app.yaml`;
+- Render authentication requires HTTPS, permits the Function identity, and
+  rejects anonymous direct access;
+- Azure discovers the liveness, readiness, and render Functions;
+- anonymous Function liveness succeeds; and
+- authorized readiness and PNG, JPEG, and PDF requests return their expected
+  status, media type, file signature, and dimensions.
+
+Reading or using a Function key is a separate credential-access action. Keep
+an approved key in memory only, never print or persist it, and clear local
+buffers after verification.
+
+## Recover from a Partial Failure
+
+There is no automatic rollback. Recover the failed boundary, then continue in
+order:
+
+- If Bicep is incomplete, inspect the failed deployment and a fresh What-If.
+  Correct the cause and reapply Bicep until the owned graph converges.
+- If identity linking fails, correct the CLI context, permissions, or selected
+  target and rerun only the link script.
+- If image build or Render deployment fails, keep the quickstart revision or
+  last accepted revision, diagnose the failure, and rerun the same reviewed
+  application source.
+- If Functions deployment fails after Render succeeds, diagnose the Functions
+  boundary and rerun the same reviewed application source so both hosts retain
+  a traceable release identity.
+- If Bicep is applied after an application release, rerun the link step when
+  the deployment identity changed, then rerun application deployment to replace
+  the intentional quickstart configuration.
+
+Do not create a broader identity, disable authentication, expose credentials,
+or delete additional resources as a recovery shortcut.
+
+## Destructive Recreation
+
+Deleting the application resource group removes the deployment identity and
+its Azure role assignments together with the application resources. GitHub
+cannot deploy again until Bicep recreates the identity and the link script
+updates the existing GitHub Environment.
+
+Treat deletion as a separate destructive operation:
+
+1. retain the exact retrievable source revision and required non-secret
+   configuration outside the resource group;
+2. verify the active subscription and resolve the exact resource-group ID;
+3. verify the external Render application and GitHub Environment;
+4. obtain explicit authorization for that exact resource-group deletion;
+5. delete only the resolved group and wait until it is absent; and
+6. run Bicep, identity linking, and application deployment as three separate
+   actions, reviewing each target before its write.
+
+Resource-group deletion is not rollback. Deleted resource-group data is not
+recoverable through this procedure. Git operations, role changes outside the
+template, credential reads, workflow dispatch, and any additional deletion
+remain separate actions.
 
 ## Development Deployment Limits
 
 - Both hosts use public HTTPS endpoints. Render is identity-protected but is
   not network-private.
 - Render scales to zero. Chromium startup can temporarily return
-  `503`/`not-ready` before readiness converges.
+  `503` or not-ready responses before readiness converges.
+- The quickstart interval and deployment failures can leave Html2B unavailable
+  until the application workflow succeeds.
 - Azure endpoints, retained images, Functions execution, logging, and telemetry
   can incur charges.
 - The service renders server-owned HTML. It is not an isolation boundary for
   caller-authored HTML or arbitrary caller-selected network and file access.
-- A Function key is a shared caller credential for the protected Functions
-  routes; it is not end-user identity or browser authentication.
+- A Function key is a shared caller credential for protected Function routes;
+  it is not end-user identity or browser authentication.
